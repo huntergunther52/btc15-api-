@@ -1,5 +1,6 @@
 const KALSHI = "https://api.elections.kalshi.com/trade-api/v2";
 const SERIES = "KXBTC15M";
+const VERSION = "3.3.0";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -8,461 +9,358 @@ const cors = {
   "Cache-Control": "no-store"
 };
 
-const out = (obj,status=200) =>
-  new Response(JSON.stringify(obj,null,2),{
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj, null, 2), {
     status,
-    headers:{...cors,"content-type":"application/json"}
+    headers: {
+      ...cors,
+      "content-type": "application/json"
+    }
   });
+}
 
-function n(...xs){
-  for(const x of xs){
-    const v=Number(x);
-    if(Number.isFinite(v)) return v;
+function number(...values) {
+  for (const value of values) {
+    const x = Number(value);
+    if (Number.isFinite(x)) return x;
   }
   return null;
 }
 
-function px(v){
-  v=Number(v);
-  if(!Number.isFinite(v)) return null;
-  return v>1?v/100:v;
+function probabilityPrice(value) {
+  const x = Number(value);
+
+  if (!Number.isFinite(x)) return null;
+
+  return x > 1 ? x / 100 : x;
 }
 
-function strike(m){
-  let v=n(
-    m.floor_strike,
-    m.strike,
-    m.target,
-    m.custom_strike?.target,
-    m.custom_strike?.value
+function extractTarget(market) {
+  const direct = number(
+    market.floor_strike,
+    market.strike,
+    market.target,
+    market.custom_strike?.target,
+    market.custom_strike?.value
   );
 
-  if(v && v>1000) return v;
+  if (direct && direct > 1000) {
+    return direct;
+  }
 
-  for(const s of [
-    m.functional_strike,
-    m.subtitle,
-    m.title,
-    m.yes_sub_title
-  ]){
-    const z=String(s||"").match(
+  const possibleText = [
+    market.functional_strike,
+    market.subtitle,
+    market.title,
+    market.yes_sub_title
+  ];
+
+  for (const text of possibleText) {
+    const match = String(text || "").match(
       /\$?\s*([0-9]{2,3}(?:,[0-9]{3})+(?:\.[0-9]+)?)/
     );
-    if(z) return Number(z[1].replaceAll(",",""));
+
+    if (match) {
+      return Number(match[1].replaceAll(",", ""));
+    }
   }
 
   return null;
 }
 
-async function kj(path){
-  const r=await fetch(KALSHI+path,{
-    headers:{"accept":"application/json"}
+async function kalshi(path) {
+  const response = await fetch(KALSHI + path, {
+    headers: {
+      accept: "application/json"
+    }
   });
 
-  const text=await r.text();
+  const raw = await response.text();
 
   let body;
-  try{ body=JSON.parse(text); }
-  catch{ body={raw:text.slice(0,1000)}; }
 
-  if(!r.ok){
-    const err=new Error(`${r.status} ${path}: ${text.slice(0,250)}`);
-    err.status=r.status;
-    throw err;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    body = {
+      raw: raw.slice(0, 1000)
+    };
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      `Kalshi ${response.status}: ${raw.slice(0, 250)}`
+    );
   }
 
   return body;
 }
 
-function harvest(o,a=[]){
-  if(!o) return a;
-
-  if(Array.isArray(o)){
-    for(const x of o) harvest(x,a);
-    return a;
-  }
-
-  if(typeof o==="object"){
-    const p=n(
-      o.price,
-      o.value,
-      o.index_value,
-      o.close,
-      o.y,
-      o.v
-    );
-
-    const raw=
-      o.ts ??
-      o.timestamp ??
-      o.time ??
-      o.t ??
-      o.datetime;
-
-    if(p && p>1000 && raw!=null){
-      let t;
-
-      if(typeof raw==="number"){
-        t=raw<1e12 ? raw*1000 : raw;
-      }else{
-        t=Date.parse(raw);
-      }
-
-      if(Number.isFinite(t)){
-        a.push({t,p});
-      }
-    }
-
-    for(const v of Object.values(o)){
-      if(v && typeof v==="object"){
-        harvest(v,a);
-      }
-    }
-  }
-
-  return a;
-}
-
 /*
- Cloudflare isolate memory.
+  Warm-isolate cache.
 
- This dramatically reduces duplicate calls while an isolate is warm.
- The browser may poll frequently, but Kalshi live-data is only refreshed
- on our controlled interval.
+  Market metadata does not need to be requested every time
+  the iPhone refreshes the dashboard.
 */
 
-let marketCache=null;
-let marketCacheAt=0;
+let marketCache = null;
+let marketCacheAt = 0;
 
-let liveCache={
-  event:null,
-  points:[],
-  latest:null,
-  fetchedAt:0,
-  error:null
-};
+const MARKET_TTL = 5000;
 
-const MARKET_TTL=10000;
-const LIVE_TTL=10000;
+async function getCurrentMarket() {
+  const now = Date.now();
 
-function dedupePoints(points){
-  const bySecond=new Map();
-
-  for(const x of points){
-    if(!Number.isFinite(x?.t) || !Number.isFinite(x?.p)) continue;
-
-    const sec=Math.floor(x.t/1000)*1000;
-
-    /*
-      If several observations occur inside the same second,
-      retain the most recent observation for that second.
-    */
-    bySecond.set(sec,{
-      t:sec,
-      p:x.p
-    });
+  if (
+    marketCache &&
+    now - marketCacheAt < MARKET_TTL
+  ) {
+    return {
+      market: marketCache,
+      cached: true,
+      cacheAgeMs: now - marketCacheAt
+    };
   }
 
-  return [...bySecond.values()]
-    .sort((a,b)=>a.t-b.t)
-    .slice(-900);
-}
-
-async function getMarket(){
-  const now=Date.now();
-
-  if(marketCache && now-marketCacheAt<MARKET_TTL){
-    return marketCache;
-  }
-
-  const q=new URLSearchParams({
-    series_ticker:SERIES,
-    status:"open",
-    limit:"50"
+  const query = new URLSearchParams({
+    series_ticker: SERIES,
+    status: "open",
+    limit: "50"
   });
 
-  const data=await kj(`/markets?${q}`);
+  const data = await kalshi(
+    `/markets?${query.toString()}`
+  );
 
-  const arr=(data.markets||[])
-    .filter(m=>{
-      const close=Date.parse(
-        m.close_time ||
-        m.expiration_time ||
-        m.expected_expiration_time ||
+  const candidates = (data.markets || [])
+    .filter(market => {
+      const close = Date.parse(
+        market.close_time ||
+        market.expiration_time ||
+        market.expected_expiration_time ||
         0
       );
 
-      return close>now-30000;
+      return close > now - 30000;
     })
-    .sort((a,b)=>{
-      const ac=Date.parse(
+    .sort((a, b) => {
+      const aClose = Date.parse(
         a.close_time ||
         a.expiration_time ||
         a.expected_expiration_time
       );
 
-      const bc=Date.parse(
+      const bClose = Date.parse(
         b.close_time ||
         b.expiration_time ||
         b.expected_expiration_time
       );
 
-      return ac-bc;
+      return aClose - bClose;
     });
 
-  if(!arr.length){
-    throw new Error("No open KXBTC15M market returned by Kalshi.");
-  }
-
-  marketCache=arr[0];
-  marketCacheAt=now;
-
-  return marketCache;
-}
-
-async function getLive(eventTicker){
-  const now=Date.now();
-
-  /*
-    New 15-minute event:
-    reset old event observations.
-  */
-  if(liveCache.event!==eventTicker){
-    liveCache={
-      event:eventTicker,
-      points:[],
-      latest:null,
-      fetchedAt:0,
-      error:null
-    };
-  }
-
-  /*
-    Don't hit Kalshi again if we queried recently.
-  */
-  if(now-liveCache.fetchedAt<LIVE_TTL){
-    return liveCache;
-  }
-
-  /*
-    Mark the attempt immediately. This helps prevent simultaneous browser
-    requests from each triggering another Kalshi request.
-  */
-  liveCache.fetchedAt=now;
-
-  try{
-    const raw=await kj(
-      `/live_data/events/${encodeURIComponent(eventTicker)}?range=15min`
+  if (!candidates.length) {
+    throw new Error(
+      "No open KXBTC15M market returned by Kalshi."
     );
-
-    const incoming=harvest(raw);
-
-    liveCache.points=dedupePoints([
-      ...liveCache.points,
-      ...incoming
-    ]);
-
-    liveCache.latest=
-      liveCache.points.length
-        ? liveCache.points[liveCache.points.length-1]
-        : liveCache.latest;
-
-    liveCache.error=null;
-
-  }catch(e){
-
-    /*
-      CRITICAL:
-      A 429 no longer destroys the last valid price data.
-      We keep serving the last successful observations.
-    */
-    liveCache.error=String(e.message||e);
   }
 
-  return liveCache;
-}
-
-function settlementStats(points,closeTime,target){
-  const close=Date.parse(closeTime);
-
-  if(
-    !Number.isFinite(close) ||
-    !Number.isFinite(target)
-  ){
-    return null;
-  }
-
-  const start=close-60000;
-
-  /*
-    Exactly one observation per second inside the final settlement minute.
-  */
-  const final=dedupePoints(points)
-    .filter(x=>x.t>=start && x.t<close);
-
-  const locked=final.length;
-
-  if(!locked){
-    return {
-      active:Date.now()>=start,
-      locked:0,
-      running_average:null,
-      average_needed:null,
-      cushion:null
-    };
-  }
-
-  const sum=final.reduce((s,x)=>s+x.p,0);
-  const avg=sum/locked;
-
-  let needed=null;
-
-  if(locked<60){
-    needed=((target*60)-sum)/(60-locked);
-  }
-
-  const latest=final[final.length-1]?.p ?? null;
+  marketCache = candidates[0];
+  marketCacheAt = now;
 
   return {
-    active:true,
-    locked,
-    running_average:avg,
-    average_needed:needed,
-    cushion:
-      Number.isFinite(latest) &&
-      Number.isFinite(needed)
-        ? latest-needed
-        : null
+    market: marketCache,
+    cached: false,
+    cacheAgeMs: 0
   };
 }
 
-async function current(){
-  const m=await getMarket();
+async function current() {
+  const result = await getCurrentMarket();
+  const m = result.market;
 
-  const closeTime=
+  const closeTime =
     m.close_time ||
     m.expiration_time ||
     m.expected_expiration_time;
 
-  const target=strike(m);
+  const closeMs = Date.parse(closeTime);
+  const now = Date.now();
 
-  const live=m.event_ticker
-    ? await getLive(m.event_ticker)
-    : {
-        points:[],
-        latest:null,
-        error:"No event ticker"
-      };
-
-  const stats=settlementStats(
-    live.points,
-    closeTime,
-    target
-  );
+  const remainingMs =
+    Number.isFinite(closeMs)
+      ? Math.max(0, closeMs - now)
+      : null;
 
   return {
-    ok:true,
-    version:"3.2",
-    server_time:new Date().toISOString(),
-    source:"Kalshi public API",
+    ok: true,
 
-    market:{
-      ticker:m.ticker,
-      event_ticker:m.event_ticker,
-      title:m.title,
-      subtitle:m.subtitle,
-      close_time:closeTime,
-      target,
+    version: VERSION,
 
-      yes_bid:px(
-        m.yes_bid_dollars ??
-        m.yes_bid
-      ),
+    server_time:
+      new Date(now).toISOString(),
 
-      yes_ask:px(
-        m.yes_ask_dollars ??
-        m.yes_ask
-      ),
+    source:
+      "Kalshi market API",
 
-      no_bid:px(
-        m.no_bid_dollars ??
-        m.no_bid
-      ),
+    architecture: {
+      kalshi_market_data: true,
 
-      no_ask:px(
-        m.no_ask_dollars ??
-        m.no_ask
-      )
+      kalshi_live_data: false,
+
+      live_price_strategy:
+        "frontend_stream",
+
+      reason:
+        "Kalshi live_data endpoint disabled to prevent 429 rate-limit failures."
     },
 
-    live:{
-      available:live.points.length>0,
-      stale:
-        live.latest
-          ? Date.now()-live.latest.t>15000
-          : true,
+    market: {
+      ticker: m.ticker,
 
-      latest:live.latest,
+      event_ticker:
+        m.event_ticker,
 
-      /*
-        Keep enough history for calculations without sending
-        unnecessary amounts to the phone.
-      */
-      points:live.points.slice(-180),
+      title:
+        m.title,
 
-      error:live.error,
-      last_attempt:
-        live.fetchedAt
-          ? new Date(live.fetchedAt).toISOString()
-          : null
+      subtitle:
+        m.subtitle,
+
+      close_time:
+        closeTime,
+
+      target:
+        extractTarget(m),
+
+      yes_bid:
+        probabilityPrice(
+          m.yes_bid_dollars ??
+          m.yes_bid
+        ),
+
+      yes_ask:
+        probabilityPrice(
+          m.yes_ask_dollars ??
+          m.yes_ask
+        ),
+
+      no_bid:
+        probabilityPrice(
+          m.no_bid_dollars ??
+          m.no_bid
+        ),
+
+      no_ask:
+        probabilityPrice(
+          m.no_ask_dollars ??
+          m.no_ask
+        )
     },
 
-    settlement:stats
+    timing: {
+      ms_remaining:
+        remainingMs,
+
+      seconds_remaining:
+        remainingMs == null
+          ? null
+          : remainingMs / 1000,
+
+      final_60:
+        remainingMs != null &&
+        remainingMs > 0 &&
+        remainingMs <= 60000
+    },
+
+    cache: {
+      market_cached:
+        result.cached,
+
+      market_cache_age_ms:
+        result.cacheAgeMs
+    }
   };
 }
 
 export default {
-  async fetch(req){
-    if(req.method==="OPTIONS"){
-      return new Response(null,{headers:cors});
+  async fetch(request) {
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: cors
+      });
     }
 
-    const u=new URL(req.url);
+    const url =
+      new URL(request.url);
 
-    try{
+    try {
 
-      if(
-        u.pathname==="/" ||
-        u.pathname==="/health"
-      ){
-        return out({
-          ok:true,
-          service:"btc15-api",
-          version:"3.2",
-          time:new Date().toISOString()
+      if (
+        url.pathname === "/" ||
+        url.pathname === "/health"
+      ) {
+        return json({
+          ok: true,
+
+          service:
+            "btc15-api",
+
+          version:
+            VERSION,
+
+          architecture:
+            "kalshi-market-plus-frontend-live-stream",
+
+          time:
+            new Date().toISOString()
         });
       }
 
-      if(u.pathname==="/api/current"){
-        return out(await current());
+      if (
+        url.pathname === "/api/current"
+      ) {
+        return json(
+          await current()
+        );
       }
 
-      return out({
-        ok:false,
-        error:"Not found",
-        routes:[
-          "/health",
-          "/api/current"
-        ]
-      },404);
+      return json(
+        {
+          ok: false,
 
-    }catch(e){
+          error:
+            "Not found",
 
-      return out({
-        ok:false,
-        error:String(e.message||e),
-        time:new Date().toISOString()
-      },502);
+          routes: [
+            "/health",
+            "/api/current"
+          ]
+        },
+        404
+      );
+
+    } catch (error) {
+
+      return json(
+        {
+          ok: false,
+
+          version:
+            VERSION,
+
+          error:
+            String(
+              error?.message ||
+              error
+            ),
+
+          time:
+            new Date().toISOString()
+        },
+        502
+      );
     }
   }
 };
