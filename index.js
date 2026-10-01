@@ -90,7 +90,7 @@ export default {
   const u=new URL(req.url);
   try{
     if(u.pathname==="/" || u.pathname==="/health")
-      return out({ok:true,service:"btc15-api",version:"1.0.0",time:new Date().toISOString()});
+      return out({ok:true,service:"btc15-api",version:"2.0.0",time:new Date().toISOString()});
     if(u.pathname==="/api/current") return out(await current());
     return out({ok:false,error:"Not found",routes:["/health","/api/current"]},404);
   }catch(e){
