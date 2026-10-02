@@ -1,127 +1,16 @@
-const KALSHI = "https://api.elections.kalshi.com/trade-api/v2";
-const SERIES = "KXBTC15M";
-const VERSION = "4.1.0";
-
-const cors = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-  "Cache-Control": "no-store"
-};
-
-function json(obj, status = 200) {
-  return new Response(JSON.stringify(obj, null, 2), { status, headers: { ...cors, "content-type": "application/json" } });
-}
-function number(...values) { for (const value of values) { const x = Number(value); if (Number.isFinite(x)) return x; } return null; }
-function probabilityPrice(value) { const x = Number(value); return Number.isFinite(x) ? (x > 1 ? x / 100 : x) : null; }
-function extractTarget(market) {
-  const direct = number(market.floor_strike, market.strike, market.target, market.custom_strike?.target, market.custom_strike?.value);
-  if (direct && direct > 1000) return direct;
-  for (const text of [market.functional_strike, market.subtitle, market.title, market.yes_sub_title]) {
-    const match = String(text || "").match(/\$?\s*([0-9]{2,3}(?:,[0-9]{3})+(?:\.[0-9]+)?)/);
-    if (match) return Number(match[1].replaceAll(",", ""));
-  }
-  return null;
-}
-async function kalshi(path) {
-  const response = await fetch(KALSHI + path, { headers: { accept: "application/json" } });
-  const raw = await response.text();
-  if (!response.ok) throw new Error(`Kalshi ${response.status}: ${raw.slice(0,250)}`);
-  try { return JSON.parse(raw); } catch { throw new Error("Kalshi returned invalid JSON"); }
-}
-
-/* Durable Object: keeps a rolling BTC spot history alive on Cloudflare even when the phone is backgrounded. */
-export class PriceHistory {
-  constructor(state) {
-    this.state = state;
-    this.points = null;
-    this.tick = 0;
-  }
-  async load() {
-    if (this.points) return;
-    this.points = (await this.state.storage.get("points")) || [];
-  }
-  async sample() {
-    await this.load();
-    try {
-      const r = await fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot", { headers: { accept: "application/json" } });
-      if (r.ok) {
-        const d = await r.json();
-        const p = Number(d?.data?.amount);
-        const t = Date.now();
-        if (Number.isFinite(p)) {
-          this.points.push({ t, p });
-          this.points = this.points.filter(x => t - x.t <= 600000).slice(-650);
-          this.tick++;
-          if (this.tick % 5 === 0) await this.state.storage.put("points", this.points);
-        }
-      }
-    } catch {}
-    await this.state.storage.setAlarm(Date.now() + 1000);
-  }
-  async alarm() { await this.sample(); }
-  async fetch(request) {
-    await this.load();
-    const url = new URL(request.url);
-    const alarm = await this.state.storage.getAlarm();
-    if (!alarm) await this.state.storage.setAlarm(Date.now() + 100);
-    if (url.pathname.endsWith("/snapshot")) {
-      const now = Date.now();
-      const pts = this.points.filter(x => now - x.t <= 300000);
-      return json({ ok:true, latest:pts.length ? pts[pts.length-1] : null, points:pts, samples:pts.length, persistent:true });
-    }
-    return json({ok:true});
-  }
-}
-
-let marketCache = null, marketCacheAt = 0;
-const MARKET_TTL = 4000;
-async function getCurrentMarket() {
-  const now = Date.now();
-  if (marketCache && now - marketCacheAt < MARKET_TTL) return { market:marketCache, cached:true, cacheAgeMs:now-marketCacheAt };
-  const query = new URLSearchParams({ series_ticker:SERIES, status:"open", limit:"50" });
-  const data = await kalshi(`/markets?${query}`);
-  const candidates = (data.markets || []).filter(m => Date.parse(m.close_time || m.expiration_time || m.expected_expiration_time || 0) > now - 30000)
-    .sort((a,b) => Date.parse(a.close_time || a.expiration_time) - Date.parse(b.close_time || b.expiration_time));
-  if (!candidates.length) throw new Error("No open KXBTC15M market returned by Kalshi.");
-  marketCache = candidates[0]; marketCacheAt = now;
-  return { market:marketCache, cached:false, cacheAgeMs:0 };
-}
-async function btcSnapshot(env) {
-  const id = env.PRICE_HISTORY.idFromName("btc-usd");
-  const stub = env.PRICE_HISTORY.get(id);
-  const r = await stub.fetch("https://collector/snapshot");
-  return r.json();
-}
-async function current(env) {
-  const [result, btc] = await Promise.all([getCurrentMarket(), btcSnapshot(env)]);
-  const m = result.market;
-  const closeTime = m.close_time || m.expiration_time || m.expected_expiration_time;
-  const closeMs = Date.parse(closeTime), now = Date.now();
-  const remainingMs = Number.isFinite(closeMs) ? Math.max(0, closeMs-now) : null;
-  return {
-    ok:true, version:VERSION, server_time:new Date(now).toISOString(), source:"Kalshi + Coinbase backend collector",
-    architecture:{ kalshi_market_data:true, backend_btc_history:true, persistent_collector:true, live_price_strategy:"cloudflare_durable_object" },
-    market:{ ticker:m.ticker, event_ticker:m.event_ticker, title:m.title, subtitle:m.subtitle, close_time:closeTime, target:extractTarget(m), yes_bid:probabilityPrice(m.yes_bid_dollars ?? m.yes_bid), yes_ask:probabilityPrice(m.yes_ask_dollars ?? m.yes_ask), no_bid:probabilityPrice(m.no_bid_dollars ?? m.no_bid), no_ask:probabilityPrice(m.no_ask_dollars ?? m.no_ask) },
-    btc,
-    timing:{ ms_remaining:remainingMs, seconds_remaining:remainingMs==null?null:remainingMs/1000, final_60:remainingMs!=null&&remainingMs>0&&remainingMs<=60000 },
-    cache:{ market_cached:result.cached, market_cache_age_ms:result.cacheAgeMs }
-  };
-}
-
-export default {
-  async fetch(request, env) {
-    if (request.method === "OPTIONS") return new Response(null,{headers:cors});
-    const url = new URL(request.url);
-    try {
-      if (url.pathname === "/" || url.pathname === "/health") {
-        const btc = await btcSnapshot(env);
-        return json({ok:true,service:"btc15-api",version:VERSION,architecture:"persistent-backend-btc-history",btc_samples:btc.samples,time:new Date().toISOString()});
-      }
-      if (url.pathname === "/api/current") return json(await current(env));
-      return json({ok:false,error:"Not found",routes:["/health","/api/current"]},404);
-    } catch (error) {
-      return json({ok:false,version:VERSION,error:String(error?.message||error),time:new Date().toISOString()},502);
-    }
-  }
-};
+const KALSHI="https://api.elections.kalshi.com/trade-api/v2",SERIES="KXBTC15M",VERSION="4.2.0";
+const cors={"Access-Control-Allow-Origin":"*","Access-Control-Allow-Methods":"GET,POST,DELETE,OPTIONS","Access-Control-Allow-Headers":"Content-Type","Cache-Control":"no-store"};
+const json=(o,s=200)=>new Response(JSON.stringify(o,null,2),{status:s,headers:{...cors,"content-type":"application/json"}});
+function number(...v){for(const x of v){const n=Number(x);if(Number.isFinite(n))return n}return null}function pp(v){const n=Number(v);return Number.isFinite(n)?(n>1?n/100:n):null}
+function target(m){const d=number(m.floor_strike,m.strike,m.target,m.custom_strike?.target,m.custom_strike?.value);if(d&&d>1000)return d;for(const s of[m.functional_strike,m.subtitle,m.title,m.yes_sub_title]){const z=String(s||"").match(/\$?\s*([0-9]{2,3}(?:,[0-9]{3})+(?:\.[0-9]+)?)/);if(z)return Number(z[1].replaceAll(",",""))}return null}
+async function kalshi(path){const r=await fetch(KALSHI+path,{headers:{accept:"application/json"}}),t=await r.text();if(!r.ok)throw Error(`Kalshi ${r.status}: ${t.slice(0,180)}`);return JSON.parse(t)}
+let marketCache=null,marketCacheAt=0;async function getMarket(){const now=Date.now();if(marketCache&&now-marketCacheAt<4000)return marketCache;const q=new URLSearchParams({series_ticker:SERIES,status:"open",limit:"50"}),d=await kalshi(`/markets?${q}`),a=(d.markets||[]).filter(m=>Date.parse(m.close_time||m.expiration_time||m.expected_expiration_time||0)>now-30000).sort((a,b)=>Date.parse(a.close_time||a.expiration_time)-Date.parse(b.close_time||b.expiration_time));if(!a.length)throw Error("No open KXBTC15M market returned by Kalshi.");marketCache=a[0];marketCacheAt=now;return marketCache}
+const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));function cdf(x){const t=1/(1+.2316419*Math.abs(x)),d=.3989423*Math.exp(-x*x/2);let p=1-d*t*(.319381530+t*(-.356563782+t*(1.781477937+t*(-1.821255978+t*1.330274429))));return x>=0?p:1-p}function std(v){if(v.length<2)return 0;const a=v.reduce((s,x)=>s+x,0)/v.length;return Math.sqrt(v.reduce((s,x)=>s+(x-a)**2,0)/(v.length-1))}
+function b64u(bytes){let s="";for(const b of bytes)s+=String.fromCharCode(b);return btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"")}function b64ud(s){s=s.replace(/-/g,"+").replace(/_/g,"/");while(s.length%4)s+="=";const x=atob(s);return Uint8Array.from(x,c=>c.charCodeAt(0))}function str64(s){return b64u(new TextEncoder().encode(s))}
+async function ensureVapid(state){let k=await state.storage.get("vapid");if(k)return k;const pair=await crypto.subtle.generateKey({name:"ECDSA",namedCurve:"P-256"},true,["sign","verify"]),priv=await crypto.subtle.exportKey("jwk",pair.privateKey),pub=await crypto.subtle.exportKey("jwk",pair.publicKey),raw=new Uint8Array(65);raw[0]=4;raw.set(b64ud(pub.x),1);raw.set(b64ud(pub.y),33);k={priv,pub:b64u(raw)};await state.storage.put("vapid",k);return k}
+async function vapidHeaders(endpoint,k){const aud=new URL(endpoint).origin,head=str64(JSON.stringify({typ:"JWT",alg:"ES256"})),body=str64(JSON.stringify({aud,exp:Math.floor(Date.now()/1000)+3600,sub:"mailto:btc15-alerts@users.noreply.github.com"})),key=await crypto.subtle.importKey("jwk",k.priv,{name:"ECDSA",namedCurve:"P-256"},false,["sign"]),sig=new Uint8Array(await crypto.subtle.sign({name:"ECDSA",hash:"SHA-256"},key,new TextEncoder().encode(head+"."+body)));return{TTL:"60",Urgency:"high",Authorization:`vapid t=${head}.${body}.${b64u(sig)}, k=${k.pub}`}}
+async function sendPush(sub,k){try{const r=await fetch(sub.endpoint,{method:"POST",headers:await vapidHeaders(sub.endpoint,k)});return r.status}catch{return 0}}
+function signal(m,pts){if(pts.length<20)return null;const now=Date.now(),close=Date.parse(m.close_time||m.expiration_time||m.expected_expiration_time),rem=(close-now)/1000;if(rem<=8||rem>300)return null;const latest=pts.at(-1),tgt=target(m),old=ms=>[...pts].reverse().find(x=>x.t<=now-ms)||pts[0],o15=old(15000),o30=old(30000),m15=latest.p-o15.p,m30=latest.p-o30.p,recent=pts.filter(x=>now-x.t<=30000),chg=[];for(let i=1;i<recent.length;i++)chg.push(recent[i].p-recent[i-1].p);const vol=std(chg),dist=latest.p-tgt,seconds=Math.max(10,Math.min(rem,300)),sigma=Math.max(18,vol*4.5*Math.sqrt(seconds/15)),trend=.18*m15+.08*m30,raw=cdf((dist+trend)/sigma),strength=clamp(.22+(300-rem)/300*.78,.22,1),ym=pp(m.yes_ask_dollars??m.yes_ask),nm=pp(m.no_ask_dollars??m.no_ask);let yp=.5+(raw-.5)*strength;if(Number.isFinite(ym))yp=.85*yp+.15*ym;yp=clamp(yp,.03,.97);const np=1-yp,ye=yp-ym,ne=np-nm,max=.3334,minE=.12,minP=.42,yok=ym>0&&ym<=max&&yp>=minP&&ye>=minE,nok=nm>0&&nm<=max&&np>=minP&&ne>=minE;if(!yok&&!nok)return null;const side=yok&&nok?(ye>=ne?"YES":"NO"):(yok?"YES":"NO"),mp=side==="YES"?ym:nm,model=side==="YES"?yp:np,edge=side==="YES"?ye:ne;return{side,marketPct:mp*100,modelPct:model*100,edge:edge*100,mult:1/mp,timeLeft:Math.round(rem),ticker:m.ticker,btc:latest.p,target:tgt,at:now}}
+export class PriceHistory{constructor(state){this.state=state;this.points=null;this.tick=0}async load(){if(!this.points)this.points=(await this.state.storage.get("points"))||[]}async sample(){await this.load();try{const r=await fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot",{headers:{accept:"application/json"}});if(r.ok){const d=await r.json(),p=Number(d?.data?.amount),t=Date.now();if(Number.isFinite(p)){this.points.push({t,p});this.points=this.points.filter(x=>t-x.t<=600000).slice(-650);if(++this.tick%5===0)await this.state.storage.put("points",this.points)}}if(this.tick%5===0)await this.checkSignal()}catch{}await this.state.storage.setAlarm(Date.now()+1000)}async checkSignal(){const subs=(await this.state.storage.get("subs"))||[];if(!subs.length)return;const m=await getMarket(),s=signal(m,this.points);await this.state.storage.put("latestSignal",s);if(!s)return;const last=(await this.state.storage.get("lastPush"))||{};const key=s.ticker+":"+s.side;if(last.key===key&&s.edge<(last.edge||0)+10)return;const k=await ensureVapid(this.state),keep=[];for(const sub of subs){const status=await sendPush(sub,k);if(status!==404&&status!==410)keep.push(sub)}await this.state.storage.put("subs",keep);await this.state.storage.put("lastPush",{key,edge:s.edge,at:Date.now()})}async alarm(){await this.sample()}async fetch(req){await this.load();const u=new URL(req.url),alarm=await this.state.storage.getAlarm();if(!alarm)await this.state.storage.setAlarm(Date.now()+100);if(u.pathname.endsWith("/snapshot")){const now=Date.now(),pts=this.points.filter(x=>now-x.t<=300000);return json({ok:true,latest:pts.at(-1)||null,points:pts,samples:pts.length,persistent:true})}if(u.pathname.endsWith("/vapid")){const k=await ensureVapid(this.state);return json({ok:true,publicKey:k.pub})}if(u.pathname.endsWith("/subscribe")&&req.method==="POST"){const sub=await req.json(),subs=(await this.state.storage.get("subs"))||[];if(sub?.endpoint&&!subs.some(x=>x.endpoint===sub.endpoint))subs.push(sub);await this.state.storage.put("subs",subs.slice(-20));return json({ok:true,subscriptions:subs.length})}if(u.pathname.endsWith("/unsubscribe")&&req.method==="POST"){const x=await req.json(),subs=((await this.state.storage.get("subs"))||[]).filter(s=>s.endpoint!==x?.endpoint);await this.state.storage.put("subs",subs);return json({ok:true})}if(u.pathname.endsWith("/signal"))return json({ok:true,signal:(await this.state.storage.get("latestSignal"))||null});return json({ok:true})}}
+function stub(env){return env.PRICE_HISTORY.get(env.PRICE_HISTORY.idFromName("btc-usd"))}async function snap(env){return (await stub(env).fetch("https://collector/snapshot")).json()}async function current(env){const[m,btc]=await Promise.all([getMarket(),snap(env)]),close=m.close_time||m.expiration_time||m.expected_expiration_time,ms=Math.max(0,Date.parse(close)-Date.now());return{ok:true,version:VERSION,server_time:new Date().toISOString(),source:"Kalshi + Coinbase backend collector",architecture:{persistent_collector:true,background_push:true},market:{ticker:m.ticker,event_ticker:m.event_ticker,title:m.title,subtitle:m.subtitle,close_time:close,target:target(m),yes_bid:pp(m.yes_bid_dollars??m.yes_bid),yes_ask:pp(m.yes_ask_dollars??m.yes_ask),no_bid:pp(m.no_bid_dollars??m.no_bid),no_ask:pp(m.no_ask_dollars??m.no_ask)},btc,timing:{ms_remaining:ms,seconds_remaining:ms/1000,final_60:ms>0&&ms<=60000}}}
+export default{async fetch(req,env){if(req.method==="OPTIONS")return new Response(null,{headers:cors});const u=new URL(req.url),s=stub(env);try{if(u.pathname==="/"||u.pathname==="/health")return json({ok:true,service:"btc15-api",version:VERSION,background_push:true,time:new Date().toISOString()});if(u.pathname==="/api/current")return json(await current(env));if(u.pathname==="/api/push/vapid")return s.fetch("https://collector/vapid");if(u.pathname==="/api/push/subscribe")return s.fetch(new Request("https://collector/subscribe",{method:"POST",headers:{"content-type":"application/json"},body:await req.text()}));if(u.pathname==="/api/push/unsubscribe")return s.fetch(new Request("https://collector/unsubscribe",{method:"POST",headers:{"content-type":"application/json"},body:await req.text()}));if(u.pathname==="/api/signal")return s.fetch("https://collector/signal");return json({ok:false,error:"Not found"},404)}catch(e){return json({ok:false,version:VERSION,error:String(e?.message||e),time:new Date().toISOString()},502)}}};
