@@ -26,4 +26,29 @@ await test('no entry into existing positions, resting orders, or higher ask',asy
 await test('disable stops new entries but continues exiting owned position',async()=>{const{engine,b}=fixture();await engine.control('enable');await engine.tick({ticker:'T'},signal);await engine.control('disable');time+=91000;b.close=time+300000;await engine.tick({ticker:'T'},null);assert.equal((await engine.status()).position,null);assert.equal((await engine.status()).history[0].exitTriggered,'TIMEOUT');await engine.tick({ticker:'NEW'},signal);assert.equal(b.calls.length,2)});
 await test('missing fills and manual position changes pause rather than guess',async()=>{const{engine,b}=fixture();await engine.control('enable');await engine.tick({ticker:'T'},signal);b.manualPosition=1;b.bid=.7;await engine.tick({ticker:'T'},signal);assert((await engine.status()).paused);assert.equal(b.calls.length,1);assert((await engine.status()).position)});
 await test('fill deduplication and conservative sizing',async()=>{const f={fill_id:'a',count_fp:'2',yes_price_dollars:'.5',no_price_dollars:'.5',fee_cost:'.03'};assert.equal(summarizeFills([f,f],'YES').quantity,2);assert.equal(sizeForBudget(.5,0),0)});
+await test('native fetch receiver is preserved during signed balance check',async()=>{
+ const originalFetch=globalThis.fetch;
+ const keys=await crypto.subtle.generateKey({name:'RSA-PSS',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},true,['sign','verify']);
+ const privateKey=Buffer.from(await crypto.subtle.exportKey('pkcs8',keys.privateKey)).toString('base64');
+ let requests=0;
+ globalThis.fetch=async function(url,options){
+  assert.equal(this,undefined,'native fetch must not receive a KalshiBroker as this');
+  assert.equal(url,'https://external-api.kalshi.com/trade-api/v2/portfolio/balance');
+  assert.equal(options.method,'GET');
+  assert(options.headers['KALSHI-ACCESS-SIGNATURE']);
+  requests++;return new Response(JSON.stringify({balance:1000}),{status:200});
+ };
+ try{
+  const broker=new KalshiBroker({AUTO_TRADING_MODE:'live',KALSHI_API_KEY_ID:'mock-key',KALSHI_PRIVATE_KEY:privateKey});
+  assert.equal(await broker.balance(),10);
+  const map=new Map();
+  const engine=new AutoEngine({get:async k=>map.get(k),put:async(k,v)=>map.set(k,v)},broker);
+  await engine.control('enable');assert.equal((await engine.status()).enabled,true);
+  assert.equal(requests,2);
+  globalThis.fetch=async()=>{throw Error('mock balance failure')};
+  const failed=new AutoEngine({get:async()=>undefined,put:async()=>assert.fail('failed activation must not save enabled state')},new KalshiBroker({AUTO_TRADING_MODE:'live',KALSHI_API_KEY_ID:'mock-key',KALSHI_PRIVATE_KEY:privateKey}));
+  await assert.rejects(failed.control('enable'),/mock balance failure/);
+  assert.equal((await failed.status()).enabled,false);
+ }finally{globalThis.fetch=originalFetch}
+});
 console.log(tests+' mocked test scenarios passed; no exchange request was made.');
