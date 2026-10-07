@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
-import worker,{PriceHistory} from './worker-autotrading.js';
+import worker,{PriceHistory,activitySnapshot} from './worker-autotrading.js';
 import panel from './owner-panel.mjs';
 import {candles,signalDataHealth} from './worker-v450.js';
 assert.equal(signalDataHealth({ticker:'T'},null,{btc:{latest:{p:80000}}},{ok:false,error:'Coinbase candles 429'}).reason,'Coinbase candles 429');
@@ -47,3 +47,7 @@ console.log('PASS: independent Kraken fallback, per-provider cooldown across res
 assert.equal(providerCalls[0],'https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1');
 const krakenLimited=await candles(async url=>url.includes('api.kraken.com')?Response.json({error:['EAPI:Rate limit exceeded']}):new Response('',{status:429}),()=>candleNow);assert(krakenLimited.error.includes('EAPI:Rate limit exceeded'));assert.equal(krakenLimited.providerRetryAt['kraken-public'],candleNow+300000);
 console.log('PASS: simple Kraken request, original public API error and rate-limit cooldown');
+
+const origin='https://huntergunther52.github.io';const activityReq=new Request('https://worker/api/auto/activity',{headers:{origin,authorization:'Bearer '+env.AUTO_TRADING_OWNER_TOKEN}});const beforeActivity=structuredClone([...map]);let brokerRead=false;p.autoEngine.broker.balance=async()=>{brokerRead=true;throw Error('must not read exchange')};const activityResponse=await worker.fetch(activityReq,env,{});assert.equal(activityResponse.headers.get('access-control-allow-origin'),origin);const activity=await activityResponse.json();assert.equal(activity.enabled,false);assert.equal(brokerRead,false);assert.deepEqual([...map],beforeActivity);assert(!JSON.stringify(activity).includes(env.AUTO_TRADING_OWNER_TOKEN));const deniedActivity=await worker.fetch(new Request('https://worker/api/auto/activity',{headers:{origin}}),env,{});assert.equal(deniedActivity.status,401);assert.equal(deniedActivity.headers.get('access-control-allow-origin'),origin);const preflight=await worker.fetch(new Request('https://worker/api/auto/activity',{method:'OPTIONS',headers:{origin}}),env,{});assert.equal(preflight.status,204);assert.equal(preflight.headers.get('access-control-allow-headers'),'Authorization');assert.equal((await worker.fetch(new Request('https://worker/api/auto/activity',{method:'POST'}),env,{})).status,405);
+const act=activitySnapshot({enabled:true,position:{ticker:'T',side:'YES',entryOrder:'c',exitOrders:[],requested:6,remaining:2},orders:[{clientOrderId:'c',orderId:'exchange-id',state:'RECONCILED',filledQuantity:2}],history:[]},'live');assert.equal(act.trade.entryFilled,2);assert.equal(act.entryOrder.orderId,'exchange-id');assert.equal(act.active,true);
+console.log('PASS: private read-only activity, owner auth, exact-origin CORS, no broker calls/state writes, confirmed fills');
