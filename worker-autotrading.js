@@ -1,7 +1,7 @@
 import ownerPanel from './owner-panel.mjs';
 import base,{PriceHistory as BasePriceHistory} from './worker-v450.js';
 import {AutoEngine,KalshiBroker,ownerAuthorized,RULES} from './auto-engine.mjs';
-const AUTO_BUILD='2026-10-07-signal-data-5';
+const AUTO_BUILD='2026-10-07-candle-cache-6';
 const reply=(data,status=200)=>new Response(JSON.stringify(data),{status,headers:{'content-type':'application/json','cache-control':'no-store'}});
 function authFailure(req,env,stage){const saved=env.AUTO_TRADING_OWNER_TOKEN,header=req.headers.get('authorization')||'',provided=header.startsWith('Bearer ')?header.slice(7):'';let detail;if(typeof saved!=='string'||saved.length<32)detail='The deployed owner secret is missing or shorter than 32 characters. Check the production secret and deploy it.';else if(!provided)detail='No owner token was received. Paste your saved password into Owner token and refresh status.';else if(provided.length<32)detail='The submitted owner token is shorter than 32 characters. Copy the complete saved password.';else if(provided.trim()!==provided)detail='The submitted owner token has extra whitespace. Copy only the saved password.';else detail='The submitted owner token does not match the deployed secret. Use the newest password saved and deployed in Cloudflare.';return reply({ok:false,error:'Owner authentication required',detail,stage},401)}
 export class PriceHistory extends BasePriceHistory{
