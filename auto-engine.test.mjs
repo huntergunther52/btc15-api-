@@ -69,4 +69,10 @@ await test('recovery refuses open markets, found orders, fills, and positions wi
  const prior=structuredClone([...map]);await assert.rejects(engine.control('archive-unresolved'));assert.deepEqual([...map],prior);assert.equal(b.calls.length,0);
  }
 });
+await test('entry health records exact filters and counts without sending orders',async()=>{
+ const{engine,b}=fixture();await engine.control('enable');await engine.tick({ticker:'T'}, {...signal,confidence:.89});let s=await engine.status();assert.equal(s.lastCheck.reason,'Confidence below 90%');assert.equal(s.lastCheck.confidence,.89);assert.equal(s.checkCounts.NO_SIGNAL,1);
+ b.close=time+481000;await engine.tick({ticker:'T'},signal);s=await engine.status();assert.equal(s.lastCheck.reason,'More than 8 minutes remaining');assert.equal(s.lastCheck.secondsRemaining,481);
+ b.close=time+300000;b.ask=.51;await engine.tick({ticker:'T'},signal);s=await engine.status();assert.equal(s.lastCheck.state,'PRICE_MOVED');assert.equal(s.lastCheck.currentAsk,.51);assert.equal(s.checkCounts.NO_SIGNAL,2);assert.equal(b.calls.length,0);
+ await engine.control('disable');await engine.tick({ticker:'T'},signal);assert.equal((await engine.status()).lastCheck.state,'OFF');assert.equal(b.calls.length,0);
+});
 console.log(tests+' mocked test scenarios passed; no exchange request was made.');
