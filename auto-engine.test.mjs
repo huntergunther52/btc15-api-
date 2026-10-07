@@ -58,4 +58,15 @@ await test('uncertain order diagnostics preserve the original failure and never 
  const diagnostic=await engine.orderDiagnostics();assert.equal(diagnostic.matchingOrderCount,0);assert.equal(diagnostic.heldContracts,0);assert.equal(diagnostic.exchangeCode,'invalid_order');assert.equal(diagnostic.submissionStage,'Kalshi response');assert.deepEqual([...map],before);assert.equal(b.calls.length,0);assert((await engine.state()).position);
  b.marketFills=async()=>{throw Error('lookup unavailable')};assert.equal((await engine.orderDiagnostics()).ok,false);assert.deepEqual([...map],before);
 });
+await test('closed-market recovery archives an attempt without trades, PNL, or activation',async()=>{
+ const{engine,b}=fixture();await engine.control('enable');b.create=async()=>{throw Error('lost acknowledgement')};await engine.tick({ticker:'T'},signal);
+ const openMarket=b.market.bind(b);b.market=async ticker=>({...await openMarket(ticker),status:'closed',close_time:new Date(time-61000).toISOString()});b.marketFills=async()=>[];
+ await engine.control('archive-unresolved');const s=await engine.status();assert.equal(s.enabled,false);assert.equal(s.paused,null);assert.equal(s.position,null);assert.equal(s.history[0].status,'UNCONFIRMED_NO_EXPOSURE');assert.equal(s.history[0].netPnlDollars,null);assert.equal(s.totalNetDollars,0);assert.equal(s.orders[0].state,'ARCHIVED_UNCONFIRMED');assert.deepEqual(s.seen,['T:YES']);assert.equal(b.calls.length,0);
+});
+await test('recovery refuses open markets, found orders, fills, and positions without changing state',async()=>{
+ for(const reason of ['active','order','fill','held','resting']){const{engine,b,map}=fixture();await engine.control('enable');b.create=async()=>{throw Error('unknown')};await engine.tick({ticker:'T'},signal);
+ b.market=async ticker=>({ticker,status:reason==='active'?'active':'closed',close_time:new Date(time-61000).toISOString()});b.marketFills=async()=>reason==='fill'?[{}]:[];if(reason==='order')b.findClient=async()=>[{}];if(reason==='held')b.positionCount=1;if(reason==='resting')b.openOrders=[{}];
+ const prior=structuredClone([...map]);await assert.rejects(engine.control('archive-unresolved'));assert.deepEqual([...map],prior);assert.equal(b.calls.length,0);
+ }
+});
 console.log(tests+' mocked test scenarios passed; no exchange request was made.');
