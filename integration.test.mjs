@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import vm from 'node:vm';
+import worker,{PriceHistory} from './worker-autotrading.js';
+import panel from './owner-panel.mjs';
+const map=new Map([['scalpLog',[{ticker:'OLD',entry:.5,exit:.6,contracts:9}]],['subs',[{endpoint:'preserved'}]]]);
+const storage={get:async k=>structuredClone(map.get(k)),put:async(k,v)=>map.set(k,structuredClone(v)),delete:async k=>map.delete(k)};
+const env={AUTO_TRADING_MODE:'disabled',AUTO_TRADING_OWNER_TOKEN:'x'.repeat(32)};const p=new PriceHistory({storage},env);env.PRICE_HISTORY={idFromName:x=>x,get:()=>({fetch:req=>p.fetch(req)})};
+const req=(path,method='GET',body,token)=>new Request('https://worker'+path,{method,headers:{...(token?{authorization:'Bearer '+token}:{}),'content-type':'application/json'},body:body?JSON.stringify(body):undefined});
+assert.equal((await worker.fetch(req('/api/auto/status'),env,{})).status,401);
+assert.equal((await worker.fetch(req('/api/auto/control','POST',{action:'enable'}),env,{})).status,401);
+const status=await(await worker.fetch(req('/api/auto/status','GET',null,env.AUTO_TRADING_OWNER_TOKEN),env,{})).json();assert.equal(status.enabled,false);assert.equal(status.mode,'disabled');assert.equal(status.rules.minScore,.9);
+assert.equal((await worker.fetch(req('/api/auto/control','POST',{action:'enable'},env.AUTO_TRADING_OWNER_TOKEN),env,{})).status,409);
+const old=structuredClone(map.get('scalpLog'));await p.scalpPaper({ticker:'T',yes_bid:.5},null);assert.deepEqual(map.get('scalpLog'),old);assert.equal(map.get('subs')[0].endpoint,'preserved');
+const page=await worker.fetch(req('/auto'),env,{});assert.equal(page.status,200);assert(page.headers.get('content-security-policy').includes("frame-ancestors 'none'"));
+const script=panel.match(/<script>([\s\S]*?)<\/script>/)[1];new vm.Script(script);assert(!script.includes('localStorage'));assert(!script.includes('sessionStorage'));assert(!panel.includes(env.AUTO_TRADING_OWNER_TOKEN));
+console.log('PASS: owner auth, disabled activation guard, rule status, preserved paper history/subscriptions, panel isolation and script syntax');

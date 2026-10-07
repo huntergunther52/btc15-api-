@@ -1,0 +1,13 @@
+import ownerPanel from './owner-panel.mjs';
+import base,{PriceHistory as BasePriceHistory} from './worker-v450.js';
+import {AutoEngine,KalshiBroker,ownerAuthorized} from './auto-engine.mjs';
+const reply=(data,status=200)=>new Response(JSON.stringify(data),{status,headers:{'content-type':'application/json','cache-control':'no-store'}});
+export class PriceHistory extends BasePriceHistory{
+ constructor(state,env){super(state,env);this.autoEngine=new AutoEngine(state.storage,new KalshiBroker(env))}
+ async scalpPaper(m,sc){const paper=await super.scalpPaper(m,sc);await this.autoEngine.tick(m,sc);return paper}
+ async fetch(req){const u=new URL(req.url);if(u.pathname.startsWith('/auto/')){if(!ownerAuthorized(req,this.env))return reply({ok:false,error:'Owner authentication required'},401);if(u.pathname==='/auto/status'&&req.method==='GET')return reply({ok:true,...await this.autoEngine.status()});if(u.pathname==='/auto/control'&&req.method==='POST'){try{const {action}=await req.json();const result=await this.autoEngine.control(action);if(action==='enable')await this.state.storage.setAlarm(Date.now()+1000);return reply({ok:true,...result})}catch(e){return reply({ok:false,error:e.message},409)}}return reply({ok:false,error:'Not found'},404)}return super.fetch(req)}
+}
+export default{
+ scheduled(event,env,ctx){return base.scheduled(event,env,ctx)},
+ async fetch(req,env,ctx){const u=new URL(req.url);if(u.pathname==='/auto'&&req.method==='GET')return new Response(ownerPanel,{headers:{'content-type':'text/html;charset=utf-8','cache-control':'no-store','content-security-policy':"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"}});if(u.pathname.startsWith('/api/auto/')){if(!ownerAuthorized(req,env))return reply({ok:false,error:'Owner authentication required'},401);const path=u.pathname.slice(4);if(!['/auto/status','/auto/control'].includes(path))return reply({ok:false,error:'Not found'},404);return env.PRICE_HISTORY.get(env.PRICE_HISTORY.idFromName('btc-usd')).fetch(new Request('https://collector'+path,{method:req.method,headers:req.headers,body:req.method==='POST'?await req.text():undefined}))}return base.fetch(req,env,ctx)}
+};

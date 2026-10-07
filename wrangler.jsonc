@@ -1,15 +1,10 @@
 {
   "name": "btc15-api",
-  "main": "worker-v450.js",
+  "main": "worker-autotrading.js",
   "compatibility_date": "2026-10-01",
   "workers_dev": true,
-  "observability": { "enabled": true },
-  "durable_objects": {
-    "bindings": [
-      { "name": "PRICE_HISTORY", "class_name": "PriceHistory" }
-    ]
-  },
-  "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["PriceHistory"] }
-  ]
+  "observability": {"enabled": true},
+  "vars": {"AUTO_TRADING_MODE": "disabled"},
+  "durable_objects": {"bindings": [{"name": "PRICE_HISTORY", "class_name": "PriceHistory"}]},
+  "migrations": [{"tag": "v1", "new_sqlite_classes": ["PriceHistory"]}]
 }
