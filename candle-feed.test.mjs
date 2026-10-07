@@ -1,0 +1,12 @@
+import assert from 'node:assert/strict';
+import {CandleFeed} from './candle-feed.mjs';
+let now=100000,calls=0;const map=new Map(),storage={get:async k=>structuredClone(map.get(k)),put:async(k,v)=>map.set(k,structuredClone(v))};
+let response={ok:true,candles:60};const read=async()=>{calls++;return response};let feed=new CandleFeed(storage,read,()=>now);
+await Promise.all(Array.from({length:20},()=>feed.get()));assert.equal(calls,1);
+now+=29999;await feed.get();assert.equal(calls,1);
+feed=new CandleFeed(storage,read,()=>now);await feed.get();assert.equal(calls,1);
+now+=1;response={ok:false,status:429,error:'Coinbase candles 429'};const failed=await feed.get();assert.equal(calls,2);assert.equal(failed.ok,false);
+now+=59999;assert.equal((await feed.get()).ok,false);assert.equal(calls,2);
+feed=new CandleFeed(storage,read,()=>now);await feed.get();assert.equal(calls,2);
+now+=1;response={ok:true,candles:60};assert.equal((await feed.get()).ok,true);assert.equal(calls,3);
+console.log('PASS: shared candle requests, 30-second expiry, persisted cache/backoff, no expired-data fallback, recovery after 429');
