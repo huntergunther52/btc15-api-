@@ -51,4 +51,11 @@ await test('native fetch receiver is preserved during signed balance check',asyn
   assert.equal((await failed.status()).enabled,false);
  }finally{globalThis.fetch=originalFetch}
 });
+await test('uncertain order diagnostics preserve the original failure and never place or clear orders',async()=>{
+ const{engine,b,map}=fixture();await engine.control('enable');b.create=async()=>{throw Object.assign(Error('Kalshi POST HTTP 400 (invalid_order)'),{stage:'Kalshi response',exchangeCode:'invalid_order'})};
+ await engine.tick({ticker:'T'},signal);const initial=await engine.state();assert.equal(initial.orders[0].error,'Kalshi POST HTTP 400 (invalid_order)');
+ b.marketFills=async()=>[];await engine.tick({ticker:'T'},signal);const before=structuredClone([...map]);
+ const diagnostic=await engine.orderDiagnostics();assert.equal(diagnostic.matchingOrderCount,0);assert.equal(diagnostic.heldContracts,0);assert.equal(diagnostic.exchangeCode,'invalid_order');assert.equal(diagnostic.submissionStage,'Kalshi response');assert.deepEqual([...map],before);assert.equal(b.calls.length,0);assert((await engine.state()).position);
+ b.marketFills=async()=>{throw Error('lookup unavailable')};assert.equal((await engine.orderDiagnostics()).ok,false);assert.deepEqual([...map],before);
+});
 console.log(tests+' mocked test scenarios passed; no exchange request was made.');
