@@ -32,7 +32,7 @@ await test('native fetch receiver is preserved during signed balance check',asyn
  const privateKey=Buffer.from(await crypto.subtle.exportKey('pkcs8',keys.privateKey)).toString('base64');
  let requests=0;
  globalThis.fetch=async function(url,options){
-  assert.equal(this,undefined,'native fetch must not receive a KalshiBroker as this');
+  assert.equal(this,globalThis,'native fetch must receive its global runtime context');
   assert.equal(url,'https://external-api.kalshi.com/trade-api/v2/portfolio/balance');
   assert.equal(options.method,'GET');
   assert(options.headers['KALSHI-ACCESS-SIGNATURE']);
