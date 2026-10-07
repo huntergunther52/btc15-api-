@@ -88,4 +88,14 @@ await test('single-order 404 falls back only to matching exchange order and neve
  assert.deepEqual(await b.order('OID','T','CID'),found);assert(requests.every(x=>x.method==='GET'));b.request=async()=>{throw Object.assign(Error('403'),{httpStatus:403})};await assert.rejects(b.order('OID','T','CID'),/403/);
  b.request=async(method,path)=>{if(path.startsWith('/portfolio/orders/OID'))throw Object.assign(Error('404'),{httpStatus:404});return{orders:[{...found,order_id:'OTHER'}]}};await assert.rejects(b.order('OID','T','CID'),/404/);
 });
+async function manualFixture(){const f=fixture();await f.engine.control('enable');await f.engine.tick({ticker:'T'},signal);f.b.positionCount=0;await f.engine.tick({ticker:'T'},signal);f.b.market=async ticker=>({ticker,status:'closed',close_time:new Date(time-61000).toISOString()});f.b.marketFills=async()=>f.b.allFills;return f}
+await test('manual close verifies fills and flat exchange, preserves history, and stays off',async()=>{
+ const{engine,b}=await manualFixture();const before=await engine.state(),calls=b.calls.length;await engine.control('reconcile-manual-close');const s=await engine.status();assert.equal(s.position,null);assert.equal(s.paused,null);assert.equal(s.enabled,false);assert.equal(b.calls.length,calls);assert.deepEqual(s.orders,before.orders);assert.deepEqual(s.seen,before.seen);assert.equal(s.history.at(-1).status,'MANUALLY_CLOSED');assert(s.history.at(-1).entry.quantity>0);assert.equal(s.history.at(-1).exit,null);assert.equal(s.history.at(-1).netPnlDollars,null);assert.equal(s.totalNetDollars,0);assert.equal(s.pauseHistory.at(-1).recovery,'VERIFIED_MANUAL_CLOSE');assert.equal((await engine.orderDiagnostics()),null);
+});
+await test('manual close refuses unresolved exposure, active market, bot exits and failed verification',async()=>{
+ for(const reason of ['held','resting','active','recent','fills','pending','read','exits','enabled']){const{engine,b,map}=await manualFixture();
+ if(reason==='held')b.positionCount=1;if(reason==='resting')b.openOrders=[{}];if(reason==='active')b.market=async()=>({status:'active',close_time:new Date(time-61000).toISOString()});if(reason==='recent')b.market=async()=>({status:'closed',close_time:new Date(time-1000).toISOString()});if(reason==='fills')b.allFills=[];if(reason==='pending')b.orders[0].status='resting';if(reason==='read')b.marketFills=async()=>{throw Error('lookup failed')};if(['exits','enabled'].includes(reason)){const s=await engine.state();if(reason==='exits')s.position.exitOrders=['other'];else s.enabled=true;await engine.save(s)}
+ const prior=structuredClone([...map]),calls=b.calls.length;await assert.rejects(engine.control('reconcile-manual-close'));assert.deepEqual([...map],prior);assert.equal(b.calls.length,calls);
+ }
+});
 console.log(tests+' mocked test scenarios passed; no exchange request was made.');
