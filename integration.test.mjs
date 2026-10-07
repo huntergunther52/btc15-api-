@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import worker,{PriceHistory} from './worker-autotrading.js';
 import panel from './owner-panel.mjs';
-import {signalDataHealth} from './worker-v450.js';
+import {candles,signalDataHealth} from './worker-v450.js';
 assert.equal(signalDataHealth({ticker:'T'},null,{btc:{latest:{p:80000}}},{ok:false,error:'Coinbase candles 429'}).reason,'Coinbase candles 429');
 assert.equal(signalDataHealth({ticker:'T'},null,{btc:{}},{ok:true}).reason,'BTC price unavailable');
 assert.equal(signalDataHealth({ticker:'T'},{side:null},{btc:{latest:{p:80000}}},{ok:true,candles:60}).available,true);
@@ -29,3 +29,7 @@ console.log('PASS: owner auth, disabled activation guard, rule status, preserved
 
 let featureReads=0;p.candleFeed.read=async()=>{featureReads++;return{ok:true,candles:60}};await p.fetch(req('/candle-features'));await p.fetch(req('/candle-features'));assert.equal(featureReads,1);
 const paths=[];const routeEnv={PRICE_HISTORY:{idFromName:x=>x,get:()=>({fetch:async r=>{const q=typeof r==='string'?new Request(r):r,path=new URL(q.url).pathname;paths.push(path);if(path==='/market')return Response.json({status:'live',market:{ticker:'TEST',close_time:new Date(Date.now()+300000).toISOString(),yes_ask:50,no_ask:50}});if(path==='/snapshot')return Response.json({latest:{p:80000},points:[]});if(path==='/candle-features')return Response.json({ok:false,error:'mock 429',retryAt:123});if(path==='/scalp-tick'){const body=await q.json();assert.equal(body.features.error,'mock 429');assert.equal(body.scalp,null);return Response.json({ok:true})}throw Error(path)}})}};await worker.fetch(req('/api/current'),routeEnv,{});assert(paths.includes('/candle-features'));console.log('PASS: shared feature endpoint and public signal route use Durable Object cache');
+
+const candleNow=1800000000000,rows=Array.from({length:60},(_,i)=>({start:String(candleNow/1000-(59-i)*60),low:'79990',high:'80010',open:'80000',close:String(80000+i),volume:'3'}));let candleCalls=[];const recovered=await candles(async url=>{candleCalls.push(url);return candleCalls.length===1?new Response('',{status:429}):Response.json({candles:rows})},()=>candleNow);assert.equal(recovered.ok,true);assert.equal(recovered.source,'coinbase-public');assert.equal(recovered.candles,60);assert.equal(recovered.momentum.m1,1);assert(candleCalls[1].includes('/market/products/BTC-USD/candles?'));assert(candleCalls[1].includes('granularity=ONE_MINUTE'));assert.equal(recovered.fallbackReason,'Coinbase candles 429');
+const failedCandles=await candles(async()=>new Response('',{status:429}),()=>candleNow);assert.equal(failedCandles.ok,false);assert.equal(failedCandles.status,429);
+let readCount=0;const staleCandles=await candles(async()=>++readCount===1?new Response('',{status:429}):Response.json({candles:rows.map(x=>({...x,start:String(Number(x.start)-300)}))}),()=>candleNow);assert.equal(staleCandles.ok,false);assert(staleCandles.error.includes('stale'));console.log('PASS: Coinbase fallback parses minute candles, retains original error, rejects stale data and dual feed failure');
