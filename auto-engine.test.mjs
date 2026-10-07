@@ -75,4 +75,15 @@ await test('entry health records exact filters and counts without sending orders
  b.close=time+300000;b.ask=.51;await engine.tick({ticker:'T'},signal);s=await engine.status();assert.equal(s.lastCheck.state,'PRICE_MOVED');assert.equal(s.lastCheck.currentAsk,.51);assert.equal(s.checkCounts.NO_SIGNAL,2);assert.equal(b.calls.length,0);
  await engine.control('disable');await engine.tick({ticker:'T'},signal);assert.equal((await engine.status()).lastCheck.state,'OFF');assert.equal(b.calls.length,0);
 });
+await test('resolved unfilled pause can be verified and cleared without placing orders or enabling',async()=>{
+ const{engine,b,map}=fixture();b.entryQty=0;await engine.control('enable');const order=b.order.bind(b);let first=true;b.order=async id=>{if(first){first=false;throw Error('Kalshi GET HTTP 404 (not_found)')}return order(id)};
+ await engine.tick({ticker:'T'},signal);assert.equal((await engine.state()).enabled,false);assert((await engine.state()).position);await engine.tick({ticker:'T'},null);let s=await engine.state();assert.equal(s.position,null);assert.equal(s.history.at(-1).status,'UNFILLED');assert(s.paused);const calls=b.calls.length;await engine.control('reconcile');s=await engine.state();assert.equal(s.paused,null);assert.equal(s.enabled,false);assert.equal(b.calls.length,calls);assert.equal(s.history.at(-1).recoveryEvidence.fillCount,0);assert.equal(s.pauseHistory.length,1);
+ s.paused='another pause';await engine.save(s);b.openOrders=[{}];const before=structuredClone([...map]);await assert.rejects(engine.control('reconcile'));assert.deepEqual([...map],before);
+});
+await test('single-order 404 falls back only to matching exchange order and never submits',async()=>{
+ const b=new KalshiBroker({AUTO_TRADING_MODE:'live'});let requests=[];const found={order_id:'OID',ticker:'T',client_order_id:'CID',status:'canceled',fill_count_fp:'0',remaining_count_fp:'0'};
+ b.request=async(method,path)=>{requests.push({method,path});if(path.startsWith('/portfolio/orders/OID'))throw Object.assign(Error('404'),{httpStatus:404});return{orders:[found]}};
+ assert.deepEqual(await b.order('OID','T','CID'),found);assert(requests.every(x=>x.method==='GET'));b.request=async()=>{throw Object.assign(Error('403'),{httpStatus:403})};await assert.rejects(b.order('OID','T','CID'),/403/);
+ b.request=async(method,path)=>{if(path.startsWith('/portfolio/orders/OID'))throw Object.assign(Error('404'),{httpStatus:404});return{orders:[{...found,order_id:'OTHER'}]}};await assert.rejects(b.order('OID','T','CID'),/404/);
+});
 console.log(tests+' mocked test scenarios passed; no exchange request was made.');
