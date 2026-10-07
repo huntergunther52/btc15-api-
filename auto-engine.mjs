@@ -6,6 +6,17 @@ const num=x=>{if(!finite(x))throw Error('Missing numeric exchange field');return
 const fee=(p,n)=>Math.ceil(.07*n*p*(1-p)*100)/100;
 export function sizeForBudget(p,budget=5){if(!(p>0&&p<1))return 0;let n=Math.floor(budget/p);while(n>0&&n*p+fee(p,n)>budget+1e-9)n--;return n}
 export function qualifies(sc,seconds){return !!sc?.side&&['YES','NO'].includes(sc.side)&&finite(sc.confidence)&&Number(sc.confidence)>=.90&&finite(seconds)&&seconds>=15&&seconds<=480&&finite(sc.entry)&&sc.entry>.04&&sc.entry<.96&&finite(sc.targetPrice)&&finite(sc.stopPrice)&&sc.targetPrice>sc.entry&&sc.stopPrice<sc.entry}
+export function signalBlockReason(sc,seconds){
+ if(!sc)return 'Signal data unavailable';
+ if(!sc.side||!['YES','NO'].includes(sc.side))return sc.reason||'Scalp model is WATCH/WAIT';
+ if(!finite(sc.confidence)||Number(sc.confidence)<.90)return 'Confidence below 90%';
+ if(!finite(seconds))return 'Market close time unavailable';
+ if(seconds>480)return 'More than 8 minutes remaining';
+ if(seconds<15)return 'Less than 15 seconds remaining';
+ if(!finite(sc.entry)||sc.entry<=.04||sc.entry>=.96)return 'Entry price outside allowed range';
+ if(!finite(sc.targetPrice)||!finite(sc.stopPrice)||sc.targetPrice<=sc.entry||sc.stopPrice>=sc.entry)return 'Invalid target or stop';
+ return null;
+}
 export function orderPayload(p,leg,quantity,heldPrice,cid){if(!(quantity>0&&Number.isInteger(quantity))||!(heldPrice>0&&heldPrice<1))throw Error('Invalid order quantity or price');const yesExposure=(p.side==='YES')===(leg==='entry');const price=p.side==='YES'?heldPrice:1-heldPrice;return{ticker:p.ticker,client_order_id:cid,side:yesExposure?'bid':'ask',count:quantity.toFixed(2),price:price.toFixed(4),time_in_force:'immediate_or_cancel',self_trade_prevention_type:'taker_at_cross',cancel_order_on_pause:true,reduce_only:leg==='exit'}}
 export function summarizeFills(fills,side){const ids=new Set;let quantity=0,value=0,fees=0;for(const f of fills){if(!f.fill_id||ids.has(f.fill_id))continue;ids.add(f.fill_id);const q=num(f.count_fp),price=num(side==='YES'?f.yes_price_dollars:f.no_price_dollars),paid=num(f.fee_cost);if(q<0||price<0||price>1||paid<0)throw Error('Invalid fill');quantity+=q;value+=q*price;fees+=paid}return{quantity,value,fees}}
 export class AutoEngine{
@@ -23,18 +34,20 @@ export class AutoEngine{
  }catch(e){return{ok:false,readOnly:true,error:e.message,stage:e.stage||'order lookup'}}
  }
  async control(action){return this.serial(async()=>{const s=await this.state();if(action==='enable'){if(!['live','demo'].includes(this.broker.mode))throw Error('Live mode is disabled in deployment configuration');if(s.position||s.paused)throw Error('Reconcile existing state before enabling');await this.broker.balance();s.enabled=true}else if(action==='reconcile'){if(!s.position)throw Error('No position to reconcile');const prior=s.paused;s.paused=null;try{await this.manage(s);s.enabled=false}catch(e){s.paused=prior||String(e.message||e);s.enabled=false;await this.save(s);throw e}}else if(action==='archive-unresolved'){await this.archiveUnresolved(s)}else if(action==='disable'){s.enabled=false}else throw Error('Unknown control action');await this.save(s);return{enabled:s.enabled,position:s.position,paused:s.paused}})}
- tick(m,sc){return this.serial(async()=>{const s=await this.state();try{if(!['live','demo'].includes(this.broker.mode))return{state:'DISABLED'};if(s.position){await this.manage(s);await this.save(s);return{state:s.position?'MANAGING':'CLOSED'}}if(!s.enabled||s.paused)return{state:'OFF',reason:s.paused};if(!m?.ticker)return{state:'NO_MARKET'};
+ tick(m,sc){return this.serial(async()=>{const s=await this.state();let detail={ticker:m?.ticker||null,side:sc?.side||null,direction:sc?.direction||null,confidence:finite(sc?.confidence)?Number(sc.confidence):null,signalStatus:sc?.status||null,signalReason:sc?.reason||null,secondsRemaining:Number.isFinite(Date.parse(m?.close_time))?(Date.parse(m.close_time)-this.clock())/1000:null};
+ const report=async(state,reason,extra={})=>{s.lastCheck={at:this.clock(),state,reason,...detail,...extra};s.checkCounts=s.checkCounts||{};s.checkCounts[state]=(s.checkCounts[state]||0)+1;await this.save(s);return{state,reason}};
+ try{if(!['live','demo'].includes(this.broker.mode))return await report('DISABLED','Deployment mode is disabled');if(s.position){await this.manage(s);await this.save(s);return await report(s.position?'MANAGING':'CLOSED','Existing position checked')}if(!s.enabled||s.paused)return await report('OFF',s.paused||'Automatic trading is disabled');if(!m?.ticker)return await report('NO_MARKET','No current market');
  const fresh=await this.broker.market(m.ticker),close=Date.parse(fresh.close_time),seconds=(close-this.clock())/1000;
- if(!qualifies(sc,seconds)||fresh.status!=='active')return{state:'NO_SIGNAL'};
- const key=fresh.ticker+':'+sc.side;if(s.seen.includes(key))return{state:'DUPLICATE'};
+ detail={...detail,secondsRemaining:seconds,marketStatus:fresh.status};if(!qualifies(sc,seconds)||fresh.status!=='active')return await report('NO_SIGNAL',fresh.status!=='active'?'Market is not active':signalBlockReason(sc,seconds));
+ const key=fresh.ticker+':'+sc.side;if(s.seen.includes(key))return await report('DUPLICATE','This ticker and side already have an entry attempt');
  const ask=num(sc.side==='YES'?fresh.yes_ask_dollars:fresh.no_ask_dollars);
  // A signal is a maximum buy price, not permission to chase the market.
- if(ask>sc.entry+1e-9||ask<=0||ask>=1)return{state:'PRICE_MOVED'};
- const balance=await this.broker.balance(),budget=Math.min(5,balance),quantity=sizeForBudget(ask,budget);if(!quantity)return{state:'INSUFFICIENT_BALANCE'};
- if(Math.abs(await this.broker.position(fresh.ticker))>1e-9||(await this.broker.resting(fresh.ticker)).length)return{state:'EXISTING_EXPOSURE'};
+ if(ask>sc.entry+1e-9||ask<=0||ask>=1)return await report('PRICE_MOVED','Current ask exceeds signal entry or is not executable',{currentAsk:ask,entryLimit:sc.entry});
+ const balance=await this.broker.balance(),budget=Math.min(5,balance),quantity=sizeForBudget(ask,budget);if(!quantity)return await report('INSUFFICIENT_BALANCE','No contract fits available balance including estimated fees');
+ if(Math.abs(await this.broker.position(fresh.ticker))>1e-9||(await this.broker.resting(fresh.ticker)).length)return await report('EXISTING_EXPOSURE','Existing account position or resting order');
  const now=this.clock();s.position={ticker:fresh.ticker,side:sc.side,target:sc.targetPrice,stop:sc.stopPrice,closeAt:close,createdAt:now,openedAt:null,entryLimit:ask,requested:quantity,entryOrder:null,exitOrders:[],remaining:0,exitTriggered:null};
- s.seen.push(key);await this.save(s);await this.submit(s,'entry',quantity,ask);await this.manage(s);await this.save(s);return{state:s.position?'MANAGING':'UNFILLED'}
- }catch(e){s.paused=String(e.message||e);s.enabled=false;await this.save(s);return{state:'PAUSED',reason:s.paused}}})}
+ s.seen.push(key);await this.save(s);await this.submit(s,'entry',quantity,ask);await this.manage(s);await this.save(s);return await report(s.position?'MANAGING':'UNFILLED','Entry submitted and reconciled')
+ }catch(e){s.paused=String(e.message||e);s.enabled=false;await this.save(s);return await report('PAUSED',s.paused)}})}
  async archiveUnresolved(s){
  const p=s.position,intent=s.orders.find(x=>x.clientOrderId===p?.entryOrder);
  if(s.enabled||!s.paused||!p||!intent||intent.orderId||intent.state!=='UNCERTAIN'||p.openedAt||p.exitOrders.length)throw Error('Only a paused, unacknowledged entry can be archived');
