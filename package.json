@@ -1,13 +1,1 @@
-{
-  "name": "btc15-api",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev"
-  },
-  "devDependencies": {
-    "wrangler": "^4.0.0"
-  }
-}
+{"name":"btc15-autotrading-review","private":true,"type":"module","scripts":{"test":"node candle-feed.test.mjs && node auto-engine.test.mjs && node integration.test.mjs"}}
