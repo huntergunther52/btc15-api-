@@ -30,7 +30,16 @@ export class AutoEngine{
  const intent=s.orders.find(x=>x.clientOrderId===p.entryOrder);
  try{
   const [matches,held,resting,fills]=await Promise.all([this.broker.findClient(p.ticker,p.entryOrder),this.broker.position(p.ticker),this.broker.resting(p.ticker),this.broker.marketFills(p.ticker)]);
-  return{ok:true,readOnly:true,ticker:p.ticker,matchingOrderCount:matches.length,heldContracts:held,restingOrderCount:resting.length,marketFillCount:fills.length,submissionError:intent?.error||(intent?.orderId?null:'Original submission error was not saved by the previous build'),submissionStage:intent?.errorStage||null,exchangeCode:intent?.exchangeCode||null,notice:'No order was submitted or cleared. An absent order is not by itself proof that submission never reached the exchange.'};
+  const known=new Set(s.orders.filter(x=>x.orderId).map(x=>x.orderId));
+  const summarize=f=>({fillId:f.fill_id||null,orderId:f.order_id||null,ticker:f.ticker||p.ticker,quantity:f.count_fp??null,side:f.side??null,action:f.action??null,yesPriceDollars:f.yes_price_dollars??null,noPriceDollars:f.no_price_dollars??null,feeDollars:f.fee_cost??null,createdTime:f.created_time??null,createdTs:f.created_ts??null});
+  const unmatched=fills.filter(f=>!f.order_id||!known.has(f.order_id));
+  let settlementRecords=null,settlementLookupError=null,marketStatus=null;
+  if(this.clock()>=p.closeAt&&typeof this.broker.settlements==='function'){
+   const results=await Promise.allSettled([this.broker.market(p.ticker),this.broker.settlements(p.ticker)]);
+   if(results[0].status==='fulfilled')marketStatus=results[0].value.status;else settlementLookupError=String(results[0].reason?.message||results[0].reason);
+   if(results[1].status==='fulfilled')settlementRecords=results[1].value.map(r=>({ticker:r.ticker,exchangeIndex:r.exchange_index,result:r.market_result,yesCount:r.yes_count_fp,noCount:r.no_count_fp,revenueCents:r.revenue,settledTime:r.settled_time,feeDollars:r.fee_cost}));else settlementLookupError=String(results[1].reason?.message||results[1].reason);
+  }
+  return{ok:true,readOnly:true,ticker:p.ticker,matchingOrderCount:matches.length,heldContracts:held,restingOrderCount:resting.length,marketFillCount:fills.length,marketStatus,settlementRecords,settlementLookupError,unmatchedFillCount:unmatched.length,unmatchedFills:unmatched.map(summarize),marketFills:fills.map(summarize),knownPositionOrderIds:s.orders.filter(x=>x.clientOrderId===p.entryOrder||p.exitOrders?.includes(x.clientOrderId)).map(x=>({clientOrderId:x.clientOrderId,orderId:x.orderId,leg:x.leg})),submissionError:intent?.error||(intent?.orderId?null:'Original submission error was not saved by the previous build'),submissionStage:intent?.errorStage||null,exchangeCode:intent?.exchangeCode||null,notice:'No order was submitted or cleared. An absent order is not by itself proof that submission never reached the exchange.'};
  }catch(e){return{ok:false,readOnly:true,error:e.message,stage:e.stage||'order lookup'}}
  }
  async control(action){return this.serial(async()=>{const s=await this.state();if(['reconcile','reconcile-manual-close','archive-unresolved'].includes(action))s.runRequested=false;if(action==='enable'){if(!['live','demo'].includes(this.broker.mode))throw Error('Live mode is disabled in deployment configuration');if(s.position||s.paused)throw Error('Reconcile existing state before enabling');await this.broker.balance();s.enabled=true;s.runRequested=true;s.recovery=null}else if(action==='reconcile'){if(!s.position){await this.reconcileFlatPause(s);await this.save(s);return{enabled:s.enabled,position:s.position,paused:s.paused}}const prior=s.paused;s.paused=null;try{await this.manage(s);s.enabled=false}catch(e){s.paused=prior||String(e.message||e);s.enabled=false;await this.save(s);throw e}}else if(action==='reconcile-manual-close'){await this.reconcileManualClose(s)}else if(action==='archive-unresolved'){await this.archiveUnresolved(s)}else if(action==='disable'){s.enabled=false;s.runRequested=false}else throw Error('Unknown control action');await this.save(s);return{enabled:s.enabled,position:s.position,paused:s.paused}})}
@@ -120,7 +129,7 @@ export class AutoEngine{
  const [records,resting,fills]=await Promise.all([this.broker.settlements(p.ticker),this.broker.resting(p.ticker),this.broker.marketFills(p.ticker)]);
  if(resting.length)throw Error('Resting orders remain; settlement reconciliation refused');
  const known=new Set(s.orders.filter(x=>x.orderId).map(x=>x.orderId));
- if(fills.some(x=>!x.order_id||!known.has(x.order_id)))throw Error('Non-bot fills found; settlement needs manual reconciliation');
+ if(fills.some(x=>!x.order_id||!known.has(x.order_id)))throw Error('Account fills not matched to bot ledger; settlement needs reconciliation');
  const intent=s.orders.find(x=>x.clientOrderId===p.entryOrder),exitIds=new Set(p.exitOrders.map(cid=>s.orders.find(x=>x.clientOrderId===cid)?.orderId));
  const marketEntry=summarizeFills(fills.filter(x=>x.order_id===intent.orderId),p.side),marketExit=summarizeFills(fills.filter(x=>exitIds.has(x.order_id)),p.side);
  for(const k of ['quantity','value','fees'])if(Math.abs(marketEntry[k]-entry[k])>1e-6||Math.abs(marketExit[k]-exit[k])>1e-6)throw Error('Settlement pending: market fills do not yet agree with order fills');
