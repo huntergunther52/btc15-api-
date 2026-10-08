@@ -111,3 +111,41 @@ await test('fresh entry quote must still agree with Kalshi confirmation',async()
  for(const kind of ['stale','wrong-market','failed','widened','falling']){const {engine,b}=fixture();await engine.control('enable');const confirmation={ticker:'T',side:'YES',passed:true,quoteCheckedAt:time,bid:.49,ask:.5};if(kind==='stale')confirmation.quoteCheckedAt-=11000;if(kind==='wrong-market')confirmation.ticker='OLD';if(kind==='failed')confirmation.passed=false;if(kind==='widened')b.bid=.46;if(kind==='falling'){b.ask=.48;b.bid=.47}await engine.tick({ticker:'T'},{...signal,confirmation});assert.equal(b.calls.length,0);assert(['CONFIRMATION_EXPIRED','QUOTE_CHANGED'].includes((await engine.status()).lastCheck.state))}
  const {engine,b}=fixture();await engine.control('enable');await engine.tick({ticker:'T'},{...signal,confirmation:{ticker:'T',side:'YES',passed:true,quoteCheckedAt:time,bid:.49,ask:.5}});assert.equal(b.calls.length,1);assert.equal((await engine.status()).position.entryConfirmation.passed,true);
 });
+
+async function settlementFixture({side='YES',partial=false,stop=false}={}){
+ const f=fixture(),{engine,b}=f;const active=b.market.bind(b);b.market=async t=>({...await active(t),exchange_index:2});
+ if(side==='NO')b.bid=.5;await engine.control('enable');await engine.tick({ticker:'T'},{...signal,side});
+ if(partial){b.exitQty=3;b.bid=.4;await engine.tick({ticker:'T'},signal)}
+ if(side==='YES')b.bid=0;else b.ask=1;
+ await engine.tick({ticker:'T'},signal);let s=await engine.state();assert.equal(s.paused,'No executable exit bid');assert.equal(s.recovery.eligible,true);
+ if(stop)await engine.control('disable');
+ time=Math.max(time+10001,s.position.closeAt+1000);b.positionCount=0;b.market=async ticker=>({ticker,exchange_index:2,status:'settled',result:'no',close_time:new Date(s.position.closeAt).toISOString()});
+ const quantity=s.position.remaining;
+ b.record={ticker:'T',exchange_index:2,market_result:'no',yes_count_fp:side==='YES'?String(quantity):'0',no_count_fp:side==='NO'?String(quantity):'0',revenue:side==='NO'?quantity*100:0,fee_cost:'.1',settled_time:new Date(s.position.closeAt+100).toISOString()};
+ b.settlements=async()=>[b.record];b.marketFills=async()=>b.allFills;
+ return f;
+}
+await test('closed settled position recovers with actual settlement revenue and fill fees, without orders',async()=>{
+ for(const side of ['YES','NO']){const {engine,b}=await settlementFixture({side});const calls=b.calls.length;await engine.tick({ticker:'NEW'},signal);const s=await engine.state(),h=s.history.at(-1);assert.equal(s.position,null);assert.equal(s.paused,null);assert.equal(s.enabled,true);assert.equal(h.status,'SETTLED');assert.equal(h.settlement.result,'no');assert.equal(h.netPnlDollars,h.exit.value+h.settlement.revenueDollars-h.entry.value-h.entry.fees-h.exit.fees);assert.equal(b.calls.length,calls);await engine.control('disable');await engine.tick({ticker:'NEW'},signal);assert.equal(s.history.length,1);assert.equal(b.calls.length,calls)}
+});
+await test('partial exit plus settlement accounts only remaining contracts and honors owner stop',async()=>{
+ const {engine,b}=await settlementFixture({partial:true,stop:true});const before=b.calls.length;await engine.tick({ticker:'NEW'},signal);const s=await engine.state(),h=s.history.at(-1);assert.equal(h.exit.quantity,3);assert.equal(h.settlement.quantity,h.entry.quantity-3);assert.equal(s.enabled,false);assert.equal(s.position,null);assert.equal(b.calls.length,before);
+});
+await test('missing settlement retries with backoff and legacy no-bid pause is migrated',async()=>{
+ const {engine,b}=await settlementFixture();b.settlements=async()=>[];const state=await engine.state();state.recovery.eligible=false;await engine.save(state);const before=b.calls.length;
+ await engine.tick({ticker:'NEW'},signal);let s=await engine.state();assert(s.position);assert.equal(s.enabled,false);assert.equal(s.recovery.eligible,true);assert(s.paused.startsWith('Settlement pending:'));assert.equal(b.calls.length,before);
+ b.settlements=async()=>[b.record];time=s.recovery.nextAt+1;await engine.tick({ticker:'NEW'},signal);s=await engine.state();assert.equal(s.position,null);assert.equal(s.enabled,true);assert.equal(b.calls.length,before);
+});
+await test('settlement refuses mismatched counts, payout, manual fills, exposure and resting orders',async()=>{
+ for(const kind of ['count','revenue','manual','held','resting','wrong-market','wrong-exchange','unfinalized','missing-market-fills']){
+  const {engine,b}=await settlementFixture();const calls=b.calls.length;
+  if(kind==='count')b.record.yes_count_fp='999';if(kind==='revenue')b.record.revenue=99999;if(kind==='manual')b.allFills.push({...b.allFills[0],fill_id:'manual',order_id:'MANUAL'});if(kind==='held')b.positionCount=1;if(kind==='resting')b.openOrders=[{}];if(kind==='wrong-market')b.record.ticker='OTHER';if(kind==='wrong-exchange')b.record.exchange_index=3;if(kind==='unfinalized')b.record.market_result='scalar';if(kind==='missing-market-fills')b.marketFills=async()=>[];
+  await engine.tick({ticker:'NEW'},signal);const s=await engine.state();assert(s.position,kind);assert.equal(s.enabled,false,kind);assert(s.paused,kind);assert.equal(s.history.length,0,kind);assert.equal(b.calls.length,calls,kind);
+ }
+});
+await test('temporary missing bid retries read-only, then resumes verified position management',async()=>{
+ const {engine,b}=fixture();await engine.control('enable');await engine.tick({ticker:'T'},signal);b.bid=0;await engine.tick({ticker:'T'},signal);const calls=b.calls.length;time+=10001;await engine.tick({ticker:'T'},signal);let s=await engine.state();assert.equal(s.paused,'No executable exit bid');assert.equal(s.recovery.eligible,true);assert.equal(b.calls.length,calls);b.bid=.4;time=s.recovery.nextAt+1;await engine.tick({ticker:'T'},signal);s=await engine.state();assert.equal(s.paused,null);assert.equal(s.enabled,true);assert.equal(b.calls.length,calls);await engine.tick({ticker:'T'},signal);assert.equal(b.calls.length,calls+1);
+});
+await test('settlement broker uses complete ticker-filtered primary-subaccount pages',async()=>{
+ const broker=new KalshiBroker({});const paths=[];broker.request=async(method,path)=>{assert.equal(method,'GET');paths.push(path);return paths.length===1?{settlements:[{ticker:'T'}],cursor:'NEXT'}:{settlements:[{ticker:'OTHER'},{ticker:'T'}],cursor:''}};const records=await broker.settlements('T');assert.equal(records.length,2);assert(paths[0].includes('/portfolio/settlements?ticker=T&subaccount=0&limit=100'));assert(paths[1].endsWith('&cursor=NEXT'));
+});
