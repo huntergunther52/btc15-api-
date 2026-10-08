@@ -149,3 +149,9 @@ await test('temporary missing bid retries read-only, then resumes verified posit
 await test('settlement broker uses complete ticker-filtered primary-subaccount pages',async()=>{
  const broker=new KalshiBroker({});const paths=[];broker.request=async(method,path)=>{assert.equal(method,'GET');paths.push(path);return paths.length===1?{settlements:[{ticker:'T'}],cursor:'NEXT'}:{settlements:[{ticker:'OTHER'},{ticker:'T'}],cursor:''}};const records=await broker.settlements('T');assert.equal(records.length,2);assert(paths[0].includes('/portfolio/settlements?ticker=T&subaccount=0&limit=100'));assert(paths[1].endsWith('&cursor=NEXT'));
 });
+
+await test('settlement diagnostics expose unmatched fills and exchange evidence without altering ledger or submitting',async()=>{
+ const {engine,b,map}=await settlementFixture();b.allFills.push({fill_id:'UNKNOWN',order_id:'ACCOUNT-ORDER',ticker:'T',count_fp:'2',yes_price_dollars:'.4',no_price_dollars:'.6',fee_cost:'.01',created_time:'2026-10-08T03:00:00Z'});await engine.tick({ticker:'NEW'},signal);
+ const before=structuredClone([...map]),calls=b.calls.length,d=await engine.orderDiagnostics();assert.equal(d.ok,true);assert.equal(d.readOnly,true);assert.equal(d.unmatchedFillCount,1);assert.equal(d.unmatchedFills[0].orderId,'ACCOUNT-ORDER');assert.equal(d.unmatchedFills[0].quantity,'2');assert.equal(d.marketStatus,'settled');assert.equal(d.settlementRecords[0].exchangeIndex,2);assert(d.knownPositionOrderIds.some(x=>x.leg==='entry'));assert.deepEqual([...map],before);assert.equal(b.calls.length,calls);
+ b.settlements=async()=>{throw Error('settlement read unavailable')};const failure=await engine.orderDiagnostics();assert.equal(failure.ok,true);assert.equal(failure.unmatchedFillCount,1);assert.equal(failure.settlementLookupError,'settlement read unavailable');assert.deepEqual([...map],before);
+});
