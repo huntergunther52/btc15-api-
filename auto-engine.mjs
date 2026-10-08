@@ -1,17 +1,17 @@
 // Offline implementation. No activation or deployment is performed by this package.
-export const RULES = Object.freeze({minScore:.90,minSeconds:15,maxSeconds:480,maxTradeDollars:5,maxHoldMs:90000});
+export const RULES = Object.freeze({minScore:.85,minSeconds:15,maxSeconds:360,maxSecondsExclusive:true,maxTradeDollars:5,maxHoldMs:90000});
 const KEY='autoTrading:v1';
 const finite=x=>x!==null&&x!==undefined&&x!==''&&Number.isFinite(Number(x));
 const num=x=>{if(!finite(x))throw Error('Missing numeric exchange field');return Number(x)};
 const fee=(p,n)=>Math.ceil(.07*n*p*(1-p)*100)/100;
 export function sizeForBudget(p,budget=5){if(!(p>0&&p<1))return 0;let n=Math.floor(budget/p);while(n>0&&n*p+fee(p,n)>budget+1e-9)n--;return n}
-export function qualifies(sc,seconds){return !!sc?.side&&['YES','NO'].includes(sc.side)&&finite(sc.confidence)&&Number(sc.confidence)>=.90&&finite(seconds)&&seconds>=15&&seconds<=480&&finite(sc.entry)&&sc.entry>.04&&sc.entry<.96&&finite(sc.targetPrice)&&finite(sc.stopPrice)&&sc.targetPrice>sc.entry&&sc.stopPrice<sc.entry}
+export function qualifies(sc,seconds){return !!sc?.side&&['YES','NO'].includes(sc.side)&&finite(sc.confidence)&&Number(sc.confidence)>=RULES.minScore&&finite(seconds)&&seconds>=RULES.minSeconds&&seconds<RULES.maxSeconds&&finite(sc.entry)&&sc.entry>.04&&sc.entry<.96&&finite(sc.targetPrice)&&finite(sc.stopPrice)&&sc.targetPrice>sc.entry&&sc.stopPrice<sc.entry}
 export function signalBlockReason(sc,seconds){
  if(!sc)return 'Signal data unavailable';
  if(!sc.side||!['YES','NO'].includes(sc.side))return sc.reason||'Scalp model is WATCH/WAIT';
- if(!finite(sc.confidence)||Number(sc.confidence)<.90)return 'Confidence below 90%';
+ if(!finite(sc.confidence)||Number(sc.confidence)<RULES.minScore)return 'Confidence below 85%';
  if(!finite(seconds))return 'Market close time unavailable';
- if(seconds>480)return 'More than 8 minutes remaining';
+ if(seconds>=RULES.maxSeconds)return '6 minutes or more remaining';
  if(seconds<15)return 'Less than 15 seconds remaining';
  if(!finite(sc.entry)||sc.entry<=.04||sc.entry>=.96)return 'Entry price outside allowed range';
  if(!finite(sc.targetPrice)||!finite(sc.stopPrice)||sc.targetPrice<=sc.entry||sc.stopPrice>=sc.entry)return 'Invalid target or stop';
