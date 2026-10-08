@@ -77,3 +77,24 @@ assert.equal(rsi(Array(20).fill(1)),50);assert.equal(rsi(Array.from({length:20},
 const savedNow=Date.now;Date.now=()=>quoteNow;
 try{map.set('kalshiQuoteHistory:v1',risingYes);const gated=await p.confirmScalp(finalQuote,candidate(),feature(80));assert.equal(gated.side,null);assert.equal(gated.confirmation.rsi14,80)}finally{Date.now=savedNow}
 console.log('PASS: YES/NO Kalshi trend + RSI gates, extremes/conflicts, stale/wrong-market/ask-only/wide quotes, warm-up, polling deduplication, Wilder RSI and shared DO confirmation');
+
+// Repeated app polling keeps fresh diagnostics without a durable write each time.
+const {AutoEngine:QuotaEngine}=await import('./auto-engine.mjs');
+let quotaTime=1800000000000,reportWrites=0;const quotaMap=new Map();
+const quotaStorage={get:async k=>structuredClone(quotaMap.get(k)),put:async(k,v)=>{reportWrites++;quotaMap.set(k,structuredClone(v))}};
+const quotaEngine=new QuotaEngine(quotaStorage,{mode:'disabled'},()=>quotaTime);
+for(let i=0;i<180;i++){await quotaEngine.tick({ticker:'T'},null);quotaTime+=1000}
+assert.equal(reportWrites,3);assert.equal((await quotaEngine.state()).lastCheck.at,quotaTime-1000);assert.equal((await quotaEngine.state()).checkCounts.DISABLED,180);
+await quotaEngine.save(await quotaEngine.state());assert.equal(reportWrites,4); // Critical state saves remain immediate.
+let diagnosticWrites=0,alarms=[];const alarmMap=new Map();const alarmStorage={get:async k=>structuredClone(alarmMap.get(k)),put:async(k,v)=>{diagnosticWrites++;alarmMap.set(k,structuredClone(v))},setAlarm:async at=>alarms.push(at)};
+const alarmObject=new PriceHistory({storage:alarmStorage},env);let checks=0;
+const oldFetch=globalThis.fetch,oldClock=Date.now;
+Date.now=()=>quotaTime;globalThis.fetch=async()=>Response.json({data:{amount:'80000'}});alarmObject.checkSignal=async()=>{checks++};alarmObject.notifyAutoHealth=async()=>{};
+try{for(let i=0;i<12;i++){await alarmObject.alarm();await alarmObject.writeDiagnostic('signalDataHealth',{at:quotaTime});quotaTime+=5000}assert.equal(alarms.length,12);assert.equal(checks,6);assert.equal(diagnosticWrites,2);assert.equal((await alarmObject.readDiagnostic('signalDataHealth')).at,quotaTime-5000);assert.equal(alarms.at(-1),quotaTime);quotaTime+=1000;await alarmObject.writeDiagnostic('signalDataHealth',{at:quotaTime});assert.equal(diagnosticWrites,3)}finally{globalThis.fetch=oldFetch;Date.now=oldClock}
+let seenWrites=0;alarmObject.state.storage.put=async()=>{seenWrites++};for(let i=0;i<20;i++)await alarmObject.alertSignals({ticker:'T'},null,null);assert.equal(seenWrites,0);
+const quotaError=Error('Exceeded allowed rows written in Durable Objects free tier.');
+const broken=new PriceHistory({storage:{get:async()=>{throw quotaError},put:async()=>{throw quotaError},setAlarm:async()=>{throw quotaError}}},env);
+await broken.notifyAutoHealth();await broken.alarm();
+const brokenEnv={...env,PRICE_HISTORY:{idFromName:x=>x,get:()=>({fetch:async()=>{throw quotaError}})}};
+const failure=await worker.fetch(req('/api/auto/config'),brokenEnv,{});assert.equal(failure.status,503);const failureBody=await failure.json();assert.equal(failureBody.tradingStatusVerified,false);assert.equal(failureBody.quotaExceeded,true);assert(failureBody.retryAt.endsWith('T00:00:00.000Z'));assert.equal('enabled' in failureBody,false);
+console.log('PASS: bounded diagnostic writes, fresh in-memory status, immediate ledger saves, single five-second alarm, unchanged alerts and readable quota failure');
