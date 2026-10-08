@@ -15,7 +15,7 @@ assert.equal((await worker.fetch(req('/api/auto/control','POST',{action:'enable'
 for(const [token,expected] of [[undefined,'No owner token'],['short','shorter than 32'],['y'.repeat(32),'does not match']]){const response=await worker.fetch(req('/api/auto/status','GET',null,token),env,{});assert.equal(response.status,401);const failure=await response.json();assert(failure.detail.includes(expected));assert.equal(failure.stage,'worker');assert(!JSON.stringify(failure).includes(env.AUTO_TRADING_OWNER_TOKEN))}
 const missing=await(await worker.fetch(req('/api/auto/status'),{...env,AUTO_TRADING_OWNER_TOKEN:undefined},{})).json();assert(missing.detail.includes('deployed owner secret is missing'));
 const inner=await(await p.fetch(req('/auto/status','GET',null,'y'.repeat(32)))).json();assert.equal(inner.stage,'storage');assert(inner.detail.includes('does not match'));
-const status=await(await worker.fetch(req('/api/auto/status','GET',null,env.AUTO_TRADING_OWNER_TOKEN),env,{})).json();assert.equal(status.enabled,false);assert.equal(status.mode,'disabled');assert.equal(status.rules.minScore,.9);assert.equal(status.build,cfg.build);assert.equal(status.connection.ok,false);assert.equal(status.connection.stage,'credentials');assert.equal(map.has('autoTrading:v1'),false);
+const status=await(await worker.fetch(req('/api/auto/status','GET',null,env.AUTO_TRADING_OWNER_TOKEN),env,{})).json();assert.equal(status.enabled,false);assert.equal(status.mode,'disabled');assert.equal(status.rules.minScore,.85);assert.equal(status.build,cfg.build);assert.equal(status.connection.ok,false);assert.equal(status.connection.stage,'credentials');assert.equal(map.has('autoTrading:v1'),false);
 p.autoEngine.broker.balance=async()=>{throw Object.assign(Error('mock signing failure'),{stage:'request signing'})};const diagnostic=await(await worker.fetch(req('/api/auto/status','GET',null,env.AUTO_TRADING_OWNER_TOKEN),env,{})).json();assert.equal(diagnostic.connection.stage,'request signing');assert.equal(diagnostic.enabled,false);assert.equal(map.has('autoTrading:v1'),false);
 const failedEnable=await(await worker.fetch(req('/api/auto/control','POST',{action:'enable'},env.AUTO_TRADING_OWNER_TOKEN),env,{})).json();assert.equal(failedEnable.build,cfg.build);
 assert.equal((await worker.fetch(req('/api/auto/control','POST',{action:'enable'},env.AUTO_TRADING_OWNER_TOKEN),env,{})).status,409);
@@ -98,3 +98,13 @@ await broken.notifyAutoHealth();await broken.alarm();
 const brokenEnv={...env,PRICE_HISTORY:{idFromName:x=>x,get:()=>({fetch:async()=>{throw quotaError}})}};
 const failure=await worker.fetch(req('/api/auto/config'),brokenEnv,{});assert.equal(failure.status,503);const failureBody=await failure.json();assert.equal(failureBody.tradingStatusVerified,false);assert.equal(failureBody.quotaExceeded,true);assert(failureBody.retryAt.endsWith('T00:00:00.000Z'));assert.equal('enabled' in failureBody,false);
 console.log('PASS: bounded diagnostic writes, fresh in-memory status, immediate ledger saves, single five-second alarm, unchanged alerts and readable quota failure');
+
+const {scalpModel,modelB}=await import('./worker-v450.js');
+const signalBase={market:{ticker:'T',yes_ask:.5,no_ask:.5,target:80000},btc:{latest:{p:80000}},timing:{seconds_remaining:300}};
+const signalFeatures={ok:true,momentum:{m1:8,m3:8,m5:8},volume:{ratio:1.3},volatility:{realized10:.00015,regime:'NORMAL'}};
+const weakScalp=scalpModel(signalBase,signalFeatures);assert(weakScalp.confidence<.85);assert.equal(weakScalp.side,null);assert(weakScalp.reason.includes('85%'));
+for(const sign of [1,-1]){const ft={...signalFeatures,momentum:{m1:sign*12,m3:sign*12,m5:sign*12}};const strongScalp=scalpModel(signalBase,ft);assert(strongScalp.confidence>=.85);assert.equal(strongScalp.side,sign>0?'YES':'NO')}
+const weakSettlement=modelB(signalBase,signalFeatures);assert(weakSettlement.predicted.probability<.85);assert.equal(weakSettlement.best,null);assert.equal(weakSettlement.bet,'NO BET');
+const strongSettlement=modelB({...signalBase,market:{...signalBase.market,yes_ask:.5,no_ask:.7,target:80100},btc:{latest:{p:79000}}},signalFeatures);assert(strongSettlement.best?.probability>=.85);
+assert.equal(status.rules.maxSeconds,360);assert.equal(status.rules.maxSecondsExclusive,true);assert(panel.includes('Score ≥85%'));assert(panel.includes('under 6 minutes'));
+console.log('PASS: scalp and settlement signals require 85 percent, live rules expose exclusive six-minute limit and owner text agrees');
