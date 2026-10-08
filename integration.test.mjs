@@ -55,3 +55,25 @@ console.log('PASS: private read-only activity, owner auth, exact-origin CORS, no
 // Attention checks must use existing state, never broker orders, and public push content excludes private details.
 map.set('autoTrading:v1',{enabled:false,runRequested:true,paused:'Account mismatch SECRET_ORDER_ID',position:null,history:[],orders:[],recovery:{startedAt:Date.now(),eligible:false}});
 map.delete('autoAttention:v1');let attentionSends=0;p.pushAll=async entry=>{attentionSends++;assert.equal(entry.kind,'BOT_ATTENTION');return{sent:1,subscriptions:1}};await p.notifyAutoHealth();await p.notifyAutoHealth();assert.equal(attentionSends,1);const attention=await(await p.fetch(new Request('https://collector/latest-alert'))).json();assert.equal(attention.alert.kind,'BOT_ATTENTION');assert(!JSON.stringify(attention).includes('SECRET_ORDER_ID'));assert(map.get('autoAttention:v1').sentAt);console.log('PASS: Worker attention notification integration, durable deduplication and public privacy');
+
+const {confirmScalp,quoteHistory,rsi}=await import('./worker-v450.js');
+const quoteNow=1800000000000;
+const rising=(side='YES')=>[0,10000,20000].map((dt,i)=>({ticker:'Q',at:quoteNow-20000+dt,yes_bid:side==='YES'?.49+i*.01:.49-i*.01,yes_ask:side==='YES'?.50+i*.01:.50-i*.01,no_bid:side==='NO'?.49+i*.01:.49-i*.01,no_ask:side==='NO'?.50+i*.01:.50-i*.01}));
+const candidate=(side='YES')=>({side,direction:side,entry:.52,confidence:.92,blockers:[],status:'TRADE '+side});
+const feature=r=>({experimental:{rsi14:r}});
+for(const [side,value] of [['YES',60],['NO',40]]){const h=rising(side),m=h.at(-1),sc=confirmScalp(candidate(side),m,feature(value),h,quoteNow);assert.equal(sc.side,side);assert.equal(sc.confirmation.passed,true)}
+for(const [side,value] of [['YES',70],['YES',80],['YES',40],['NO',30],['NO',20],['NO',60],['YES',null]]){const h=rising(side),sc=confirmScalp(candidate(side),h.at(-1),feature(value),h,quoteNow);assert.equal(sc.side,null);assert(sc.reason.includes('RSI'))}
+const risingYes=rising(),finalQuote=risingYes.at(-1);
+for(const h of [risingYes.map(r=>({...r,ticker:'OLD'})),risingYes.slice(-1),risingYes.map(r=>({...r,at:r.at-120000}))])assert.equal(confirmScalp(candidate(),finalQuote,feature(60),h,quoteNow).side,null);
+const falling=rising('NO');assert.equal(confirmScalp(candidate(),falling.at(-1),feature(60),falling,quoteNow).side,null);
+const askOnly=risingYes.map(r=>({...r,yes_bid:.49}));assert.equal(confirmScalp(candidate(),askOnly.at(-1),feature(60),askOnly,quoteNow).side,null);
+const wide=risingYes.map(r=>({...r,yes_ask:r.yes_bid+.06}));assert(confirmScalp(candidate(),wide.at(-1),feature(60),wide,quoteNow).reason.includes('spread'));
+assert.equal(quoteHistory(risingYes,{...finalQuote,ticker:'NEW'},quoteNow).length,1);
+assert.equal(quoteHistory(risingYes,finalQuote,quoteNow+1000).length,3);
+assert.equal(quoteHistory(risingYes,finalQuote,quoteNow+16000).length,1);
+assert.equal(confirmScalp({...candidate(),side:null,blockers:['existing blocker']},finalQuote,feature(60),risingYes,quoteNow).side,null);
+assert.equal(rsi(Array(20).fill(1)),50);assert.equal(rsi(Array.from({length:20},(_,i)=>i)),100);assert.equal(rsi(Array.from({length:20},(_,i)=>20-i)),0);assert.equal(rsi([1,2]),null);
+// Both the alarm path and app path use the same persisted, serialized confirmation history.
+const savedNow=Date.now;Date.now=()=>quoteNow;
+try{map.set('kalshiQuoteHistory:v1',risingYes);const gated=await p.confirmScalp(finalQuote,candidate(),feature(80));assert.equal(gated.side,null);assert.equal(gated.confirmation.rsi14,80)}finally{Date.now=savedNow}
+console.log('PASS: YES/NO Kalshi trend + RSI gates, extremes/conflicts, stale/wrong-market/ask-only/wide quotes, warm-up, polling deduplication, Wilder RSI and shared DO confirmation');
