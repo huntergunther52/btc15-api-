@@ -62,7 +62,7 @@ export class AutoEngine{
  async recover(s){
  const r=s.recovery;r.attempts++;r.nextAt=this.clock()+Math.min(60000,10000*2**Math.min(r.attempts-1,3));
  try{
-  if(s.position){await this.manage(s);if(!s.position&&s.history.at(-1)?.status==='UNFILLED')await this.reconcileFlatPause(s)}
+  if(s.position){await this.manage(s)}
   else if(s.history.at(-1)?.status==='UNFILLED')await this.reconcileFlatPause(s);else{const ticker=s.lastCheck?.ticker;if(!ticker||s.orders.some(x=>['PENDING','ACKNOWLEDGED','UNCERTAIN'].includes(x.state)))throw Error('Cannot verify unresolved durable order state');await this.broker.balance();const [held,resting]=await Promise.all([this.broker.position(ticker),this.broker.resting(ticker)]);if(!Number.isFinite(held)||Math.abs(held)>1e-9||resting.length)throw Error('Account exposure remains; manual reconciliation required')}
   // manage keeps paused positions read-only. Clear only after terminal orders, fills and holdings agree.
   s.pauseHistory=s.pauseHistory||[];s.pauseHistory.push({at:this.clock(),reason:s.paused||s.lastError?.message,recovery:'AUTOMATIC_VERIFIED'});s.paused=null;s.enabled=s.runRequested===true;s.recovery={...r,resolvedAt:this.clock(),eligible:false};
