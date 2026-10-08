@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {AutoEngine,RULES,qualifies,orderPayload,sizeForBudget,summarizeFills,ownerAuthorized,KalshiBroker} from './auto-engine.mjs';
 let time=1000000,ids=0;const signal={side:'YES',confidence:.90,entry:.5,targetPrice:.62,stopPrice:.42};
 class Broker{
- constructor(){this.mode='live';this.calls=[];this.orders=[];this.allFills=[];this.positionCount=0;this.ask=.5;this.bid=.49;this.close=time+480000;this.entryQty=null;this.exitQty=null;this.throwAfterAccept=false;this.manualPosition=0;this.openOrders=[]}
+ constructor(){this.mode='live';this.calls=[];this.orders=[];this.allFills=[];this.positionCount=0;this.ask=.5;this.bid=.49;this.close=time+300000;this.entryQty=null;this.exitQty=null;this.throwAfterAccept=false;this.manualPosition=0;this.openOrders=[]}
  async balance(){return 10}
  async market(ticker){return{ticker,status:'active',close_time:new Date(this.close).toISOString(),yes_ask_dollars:String(this.ask),yes_bid_dollars:String(this.bid),no_ask_dollars:String(1-this.bid),no_bid_dollars:String(1-this.ask)}}
  async position(){return this.positionCount+this.manualPosition}
@@ -14,7 +14,7 @@ class Broker{
 }
 function fixture(){const map=new Map,b=new Broker,storage={get:async k=>structuredClone(map.get(k)),put:async(k,v)=>map.set(k,structuredClone(v))},engine=new AutoEngine(storage,b,()=>time,()=>String(++ids));return{engine,b,map}}
 let tests=0;async function test(name,fn){await fn();tests++;console.log('PASS '+name)}
-await test('score and clock boundary filters',async()=>{for(const seconds of [15,480])assert(qualifies(signal,seconds));for(const seconds of [14,481,NaN])assert(!qualifies(signal,seconds));assert(!qualifies({...signal,confidence:.8999},300));assert(!qualifies({...signal,side:null},300))});
+await test('score and clock boundary filters',async()=>{for(const seconds of [15,359.999])assert(qualifies(signal,seconds));for(const seconds of [14,360,361,NaN])assert(!qualifies(signal,seconds));assert(!qualifies({...signal,confidence:.8499},300));assert(!qualifies({...signal,side:null},300))});
 await test('YES/NO entry and exit book direction',async()=>{assert.equal(orderPayload({ticker:'T',side:'YES'},'entry',2,.3,'a').side,'bid');assert.equal(orderPayload({ticker:'T',side:'YES'},'exit',2,.4,'a').side,'ask');const n=orderPayload({ticker:'T',side:'NO'},'entry',2,.3,'a');assert.equal(n.side,'ask');assert.equal(n.price,'0.7000');const e=orderPayload({ticker:'T',side:'NO'},'exit',2,.4,'a');assert.equal(e.side,'bid');assert.equal(e.price,'0.6000');assert(e.reduce_only)});
 await test('entry and exit use market exchange balance and preserve sizing evidence',async()=>{const{engine,b}=fixture();const market=b.market.bind(b);b.market=async t=>({...await market(t),exchange_index:2});const reads=[];b.balance=async index=>{reads.push(index);return index===2?12.8597:0};await engine.control('enable');await engine.tick({ticker:'T'},signal);assert.deepEqual(reads,[undefined,2]);assert.equal(b.calls[0].exchange_index,2);let state=await engine.status();assert.equal(state.position.exchangeIndex,2);assert.equal(state.position.balanceAtEntry.balanceDollars,12.8597);assert(state.position.balanceAtEntry.estimatedCostDollars<=5);b.bid=.65;await engine.tick({ticker:'T'},signal);assert.equal(b.calls[1].exchange_index,2);assert.equal((await engine.status()).history[0].balanceAtEntry.balanceDollars,12.8597)});
 await test('an empty market exchange balance blocks orders despite aggregate cash',async()=>{const{engine,b}=fixture();const market=b.market.bind(b);b.market=async t=>({...await market(t),exchange_index:1});b.balance=async index=>index===1?0:12.85;await engine.control('enable');await engine.tick({ticker:'T'},signal);assert.equal(b.calls.length,0);assert.equal((await engine.status()).lastCheck.state,'INSUFFICIENT_BALANCE');assert.equal(orderPayload({ticker:'T',side:'YES'},'entry',1,.5,'test').exchange_index,-1)});
@@ -72,8 +72,8 @@ await test('recovery refuses open markets, found orders, fills, and positions wi
  }
 });
 await test('entry health records exact filters and counts without sending orders',async()=>{
- const{engine,b}=fixture();await engine.control('enable');await engine.tick({ticker:'T'}, {...signal,confidence:.89});let s=await engine.status();assert.equal(s.lastCheck.reason,'Confidence below 90%');assert.equal(s.lastCheck.confidence,.89);assert.equal(s.checkCounts.NO_SIGNAL,1);
- b.close=time+481000;await engine.tick({ticker:'T'},signal);s=await engine.status();assert.equal(s.lastCheck.reason,'More than 8 minutes remaining');assert.equal(s.lastCheck.secondsRemaining,481);
+ const{engine,b}=fixture();await engine.control('enable');await engine.tick({ticker:'T'}, {...signal,confidence:.84});let s=await engine.status();assert.equal(s.lastCheck.reason,'Confidence below 85%');assert.equal(s.lastCheck.confidence,.84);assert.equal(s.checkCounts.NO_SIGNAL,1);
+ b.close=time+360000;await engine.tick({ticker:'T'},signal);s=await engine.status();assert.equal(s.lastCheck.reason,'6 minutes or more remaining');assert.equal(s.lastCheck.secondsRemaining,360);
  b.close=time+300000;b.ask=.51;await engine.tick({ticker:'T'},signal);s=await engine.status();assert.equal(s.lastCheck.state,'PRICE_MOVED');assert.equal(s.lastCheck.currentAsk,.51);assert.equal(s.checkCounts.NO_SIGNAL,2);assert.equal(b.calls.length,0);
  await engine.control('disable');await engine.tick({ticker:'T'},signal);assert.equal((await engine.status()).lastCheck.state,'OFF');assert.equal(b.calls.length,0);
 });
@@ -161,3 +161,5 @@ await test('manual reduction caps exits and records unknown attribution',async()
 await test('manual flatten does not trigger a replacement exit or stop entries',async()=>{const{engine,b}=fixture();await engine.control('enable');await engine.tick({ticker:'T'},signal);b.manualPosition=-b.positionCount;const calls=b.calls.length;await engine.tick({ticker:'T'},signal);const s=await engine.state();assert.equal(s.position,null);assert.equal(s.paused,null);assert.equal(s.enabled,true);assert.equal(s.history.at(-1).netPnlDollars,null);assert.equal(b.calls.length,calls)});
 
 await test('storage quota failure before order intent prevents exchange submission',async()=>{const {engine,b}=fixture();await engine.control('enable');engine.storage.put=async()=>{throw Error('Exceeded allowed rows written in Durable Objects free tier.')};await assert.rejects(engine.tick({ticker:'T'},signal),/Exceeded allowed rows written/);assert.equal(b.calls.length,0)});
+
+await test('85 percent enters only below six minutes for YES and NO',async()=>{for(const side of ['YES','NO']){const {engine,b}=fixture();await engine.control('enable');const sc={...signal,side,confidence:.85,entry:side==='YES'?.5:.51,targetPrice:.7,stopPrice:.4};b.close=time+360000;await engine.tick({ticker:'T'},sc);assert.equal(b.calls.length,0);b.close=time+359999;await engine.tick({ticker:'T'},sc);assert.equal(b.calls.length,1)}});
