@@ -36,7 +36,7 @@ export class AutoEngine{
  async control(action){return this.serial(async()=>{const s=await this.state();if(['reconcile','reconcile-manual-close','archive-unresolved'].includes(action))s.runRequested=false;if(action==='enable'){if(!['live','demo'].includes(this.broker.mode))throw Error('Live mode is disabled in deployment configuration');if(s.position||s.paused)throw Error('Reconcile existing state before enabling');await this.broker.balance();s.enabled=true;s.runRequested=true;s.recovery=null}else if(action==='reconcile'){if(!s.position){await this.reconcileFlatPause(s);await this.save(s);return{enabled:s.enabled,position:s.position,paused:s.paused}}const prior=s.paused;s.paused=null;try{await this.manage(s);s.enabled=false}catch(e){s.paused=prior||String(e.message||e);s.enabled=false;await this.save(s);throw e}}else if(action==='reconcile-manual-close'){await this.reconcileManualClose(s)}else if(action==='archive-unresolved'){await this.archiveUnresolved(s)}else if(action==='disable'){s.enabled=false;s.runRequested=false}else throw Error('Unknown control action');await this.save(s);return{enabled:s.enabled,position:s.position,paused:s.paused}})}
  tick(m,sc){return this.serial(async()=>{const s=await this.state();let detail={ticker:m?.ticker||null,side:sc?.side||null,direction:sc?.direction||null,confidence:finite(sc?.confidence)?Number(sc.confidence):null,signalStatus:sc?.status||null,signalReason:sc?.reason||null,confirmation:sc?.confirmation||null,secondsRemaining:Number.isFinite(Date.parse(m?.close_time))?(Date.parse(m.close_time)-this.clock())/1000:null};
  const report=async(state,reason,extra={})=>{s.lastCheck={at:this.clock(),state,reason,...detail,...extra};s.checkCounts=s.checkCounts||{};s.checkCounts[state]=(s.checkCounts[state]||0)+1;await this.save(s);return{state,reason}};
- try{if(s.enabled&&s.runRequested===undefined)s.runRequested=true;if(!['live','demo'].includes(this.broker.mode))return await report('DISABLED','Deployment mode is disabled');if(s.paused){if(!s.recovery&&s.history.at(-1)?.status==='UNFILLED')s.recovery={startedAt:this.clock(),nextAt:0,attempts:0,eligible:true};if(s.recovery?.eligible&&this.clock()>=(s.recovery.nextAt||0)){await this.recover(s);return await report(s.paused?'RECOVERING':'RECOVERED',s.paused||'Exchange checks agree; automatic recovery completed')}return await report('PAUSED',s.paused)}if(s.position){await this.manage(s);await this.save(s);return await report(s.position?'MANAGING':'CLOSED','Existing position checked')}if(!s.enabled||s.paused)return await report('OFF',s.paused||'Automatic trading is disabled');if(!m?.ticker)return await report('NO_MARKET','No current market');
+ try{if(s.enabled&&s.runRequested===undefined)s.runRequested=true;if(!['live','demo'].includes(this.broker.mode))return await report('DISABLED','Deployment mode is disabled');if(s.paused){if(s.position&&/^(No executable exit bid|Market closed with an open position; settlement reconciliation required)$/.test(s.paused)&&!s.recovery?.eligible){s.recovery={startedAt:s.recovery?.startedAt||s.lastError?.at||this.clock(),nextAt:0,attempts:s.recovery?.attempts||0,eligible:true}}if(!s.recovery&&s.history.at(-1)?.status==='UNFILLED')s.recovery={startedAt:this.clock(),nextAt:0,attempts:0,eligible:true};if(s.recovery?.eligible&&this.clock()>=(s.recovery.nextAt||0)){await this.recover(s);return await report(s.paused?'RECOVERING':'RECOVERED',s.paused||'Exchange checks agree; automatic recovery completed')}return await report('PAUSED',s.paused)}if(s.position){await this.manage(s);await this.save(s);return await report(s.position?'MANAGING':'CLOSED','Existing position checked')}if(!s.enabled||s.paused)return await report('OFF',s.paused||'Automatic trading is disabled');if(!m?.ticker)return await report('NO_MARKET','No current market');
  const fresh=await this.broker.market(m.ticker),close=Date.parse(fresh.close_time),seconds=(close-this.clock())/1000;
  detail={...detail,secondsRemaining:seconds,marketStatus:fresh.status};if(!qualifies(sc,seconds)||fresh.status!=='active')return await report('NO_SIGNAL',fresh.status!=='active'?'Market is not active':signalBlockReason(sc,seconds));
  const key=fresh.ticker+':'+sc.side;if(s.seen.includes(key))return await report('DUPLICATE','This ticker and side already have an entry attempt');
@@ -49,7 +49,7 @@ export class AutoEngine{
  const now=this.clock();s.position={ticker:fresh.ticker,exchangeIndex,balanceAtEntry:{at:this.clock(),balanceDollars:balance,estimatedCostDollars:quantity*ask+fee(ask,quantity),budgetDollars:budget},side:sc.side,entryConfirmation:sc.confirmation||null,target:sc.targetPrice,stop:sc.stopPrice,closeAt:close,createdAt:now,openedAt:null,entryLimit:ask,requested:quantity,entryOrder:null,exitOrders:[],remaining:0,exitTriggered:null};
  s.seen.push(key);await this.save(s);await this.submit(s,'entry',quantity,ask);await this.manage(s);await this.save(s);return await report(s.position?'MANAGING':'UNFILLED','Entry submitted and reconciled')
  }catch(e){s.lastError={at:this.clock(),message:String(e.message||e),stage:e.stage||null,method:e.method||null,path:e.requestPath||null,httpStatus:e.httpStatus||null};const eligible=this.recoverable(e);s.recovery={...(s.paused&&!s.recovery?.resolvedAt&&s.recovery?s.recovery:{startedAt:this.clock(),attempts:0}),eligible,nextAt:this.clock()+10000};s.paused=String(e.message||e);s.enabled=false;await this.save(s);return await report('PAUSED',s.paused)}})}
- recoverable(e){return (e.method==='GET'&&(e.httpStatus===404||e.httpStatus===429||e.httpStatus>=500))||/lost response|Order outcome uncertain|Unresolved order |Fills not yet reconciled|Order is not terminal|fetch failed|network|timed out|aborted/i.test(String(e.message||e))}
+ recoverable(e){return (e.method==='GET'&&(e.httpStatus===404||e.httpStatus===429||e.httpStatus>=500))||/No executable exit bid|Settlement pending|Market closed with an open position; settlement reconciliation required|lost response|Order outcome uncertain|Unresolved order |Fills not yet reconciled|Order is not terminal|fetch failed|network|timed out|aborted/i.test(String(e.message||e))}
  async recover(s){
  const r=s.recovery;r.attempts++;r.nextAt=this.clock()+Math.min(60000,10000*2**Math.min(r.attempts-1,3));
  try{
@@ -96,11 +96,14 @@ export class AutoEngine{
  if(!entry.quantity){if(Math.abs(await this.broker.position(p.ticker))>1e-9||(await this.broker.resting(p.ticker)).length)throw Error('Account exposure remains after unfilled entry; manual reconciliation required');s.history.push({...p,status:'UNFILLED',entry,exit,netPnlDollars:0,closedAt:this.clock()});s.position=null;return}
  if(!p.openedAt)p.openedAt=s.orders.find(x=>x.clientOrderId===p.entryOrder).at;
  const held=await this.broker.position(p.ticker),expected=(p.side==='YES'?1:-1)*p.remaining;
+ // Closed markets can become flat through settlement, without any exit fill.
+ const fresh=p.remaining>1e-6?await this.broker.market(p.ticker):null,now=this.clock();
+ if(fresh&&(fresh.status!=='active'||now>=p.closeAt)){await this.reconcileSettlement(s,fresh,entry,exit,held);return}
  if(Math.abs(held-expected)>1e-6)throw Error('Account position differs from bot ledger; manual reconciliation required');
- if(p.remaining<=1e-6){s.history.push({...p,status:'CLOSED',entry,exit,netPnlDollars:exit.value-entry.value-entry.fees-exit.fees,closedAt:this.clock()});s.position=null;return}
- if(s.paused)return; // Disable new entries but keep monitoring; uncertain orders need reconciliation first.
- const fresh=await this.broker.market(p.ticker),bid=num(p.side==='YES'?fresh.yes_bid_dollars:fresh.no_bid_dollars),now=this.clock();
- if(fresh.status!=='active'||now>=p.closeAt)throw Error('Market closed with an open position; settlement reconciliation required');
+ if(p.remaining<=1e-6){s.history.push({...p,status:'CLOSED',entry,exit,netPnlDollars:exit.value-entry.value-entry.fees-exit.fees,closedAt:now});s.position=null;return}
+ const rawBid=p.side==='YES'?fresh.yes_bid_dollars:fresh.no_bid_dollars,bid=finite(rawBid)?Number(rawBid):null;
+ if(s.paused){if(s.paused==='No executable exit bid'&&!(bid>0&&bid<1))throw Error('No executable exit bid');return} // Recovery verifies; it never sends an exit.
+
  if(!p.exitTriggered){if(bid>=p.target)p.exitTriggered='TAKE_PROFIT';else if(bid<=p.stop)p.exitTriggered='STOP';else if(now-p.openedAt>=90000||p.closeAt-now<=15000)p.exitTriggered='TIMEOUT'}
  if(!p.exitTriggered)return;if(!(bid>0&&bid<1))throw Error('No executable exit bid');
  // Exit remains latched across partial fills. Never reverse or sell more than owned.
@@ -109,6 +112,29 @@ export class AutoEngine{
  // Reconcile immediately, with a later tick retrying only the unfilled remainder.
  const last=await this.resolve(s,p.exitOrders.at(-1));p.remaining-=last.quantity;await this.save(s);
  if(p.remaining<=1e-6){await this.finish(s)}
+ }
+ async reconcileSettlement(s,market,entry,exit,held){
+ const p=s.position,close=Date.parse(market.close_time);
+ if(!['closed','settled','finalized'].includes(market.status)||!Number.isFinite(close)||this.clock()<close)throw Error('Settlement pending: market has not closed');
+ if(!Number.isFinite(held)||Math.abs(held)>1e-6)throw Error('Settlement pending: exchange holdings are not flat');
+ const [records,resting,fills]=await Promise.all([this.broker.settlements(p.ticker),this.broker.resting(p.ticker),this.broker.marketFills(p.ticker)]);
+ if(resting.length)throw Error('Resting orders remain; settlement reconciliation refused');
+ const known=new Set(s.orders.filter(x=>x.orderId).map(x=>x.orderId));
+ if(fills.some(x=>!x.order_id||!known.has(x.order_id)))throw Error('Non-bot fills found; settlement needs manual reconciliation');
+ const intent=s.orders.find(x=>x.clientOrderId===p.entryOrder),exitIds=new Set(p.exitOrders.map(cid=>s.orders.find(x=>x.clientOrderId===cid)?.orderId));
+ const marketEntry=summarizeFills(fills.filter(x=>x.order_id===intent.orderId),p.side),marketExit=summarizeFills(fills.filter(x=>exitIds.has(x.order_id)),p.side);
+ for(const k of ['quantity','value','fees'])if(Math.abs(marketEntry[k]-entry[k])>1e-6||Math.abs(marketExit[k]-exit[k])>1e-6)throw Error('Settlement pending: market fills do not yet agree with order fills');
+ const matches=records.filter(x=>x.ticker===p.ticker&&x.exchange_index===p.exchangeIndex);
+ if(matches.length!==1)throw Error('Settlement pending: a unique matching exchange settlement is not available');
+ const record=matches[0],yes=num(record.yes_count_fp),no=num(record.no_count_fp),quantity=p.side==='YES'?yes:no,opposite=p.side==='YES'?no:yes,settledAt=Date.parse(record.settled_time);
+ if(quantity<0||opposite!==0||Math.abs(quantity-p.remaining)>1e-6)throw Error('Settlement quantities differ from bot ledger; manual reconciliation required');
+ if(!Number.isFinite(settledAt)||settledAt<close||settledAt>this.clock()+1000||!['yes','no'].includes(record.market_result))throw Error('Settlement pending: final binary settlement evidence unavailable');
+ if(market.result&&market.result!==record.market_result)throw Error('Market and account settlement results disagree');
+ const expectedRevenue=(record.market_result===p.side.toLowerCase()?quantity:0),revenue=num(record.revenue)/100;
+ if(Math.abs(revenue-expectedRevenue)>1e-6)throw Error('Settlement payout differs from binary contract value; manual reconciliation required');
+ // fee_cost is the settlement record's aggregated trading fees, already counted from fills.
+ const evidence={...record,checkedAt:this.clock(),heldContracts:held,restingOrderCount:0,marketFillCount:fills.length};
+ s.history.push({...p,remaining:0,status:'SETTLED',entry,exit,settlement:{quantity,revenueDollars:revenue,result:record.market_result,settledAt},settlementEvidence:evidence,netPnlDollars:exit.value+revenue-entry.value-entry.fees-exit.fees,closedAt:settledAt});s.position=null;
  }
  async finish(s){const p=s.position,entry=await this.resolve(s,p.entryOrder);let exit={quantity:0,value:0,fees:0};for(const id of p.exitOrders){const z=await this.resolve(s,id);for(const k of Object.keys(exit))exit[k]+=z[k]}if(Math.abs(await this.broker.position(p.ticker))>1e-6)throw Error('Exchange position not flat after exit');s.history.push({...p,status:'CLOSED',entry,exit,netPnlDollars:exit.value-entry.value-entry.fees-exit.fees,closedAt:this.clock()});s.position=null}
 }
@@ -123,6 +149,7 @@ export class KalshiBroker{
  async findClient(ticker,cid){return(await this.pages('/portfolio/orders?ticker='+encodeURIComponent(ticker),'orders')).filter(x=>x.client_order_id===cid)}
  async order(id,ticker,cid){let d;try{d=await this.request('GET','/portfolio/orders/'+encodeURIComponent(id))}catch(e){if(e.httpStatus!==404||!ticker||!cid)throw e;const matches=(await this.findClient(ticker,cid)).filter(x=>x.order_id===id&&x.ticker===ticker);if(matches.length!==1)throw e;d={order:matches[0]}}if(d.order?.order_id!==id||(ticker&&d.order.ticker!==ticker)||(cid&&d.order.client_order_id!==cid))throw Error('Order mismatch');return d.order}
  async fills(id){return(await this.pages('/portfolio/fills?order_id='+encodeURIComponent(id),'fills')).filter(x=>x.order_id===id)}
+ async settlements(ticker){return(await this.pages('/portfolio/settlements?ticker='+encodeURIComponent(ticker)+'&subaccount=0','settlements')).filter(x=>x.ticker===ticker)}
  async marketFills(ticker){return(await this.pages('/portfolio/fills?ticker='+encodeURIComponent(ticker),'fills')).filter(x=>x.ticker===ticker)}
  async create(body){return this.request('POST','/portfolio/events/orders',body)}
 }
