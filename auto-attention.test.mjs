@@ -1,0 +1,11 @@
+import assert from 'node:assert/strict';
+import {AutoAttention} from './auto-attention.mjs';
+let now=1000000;const map=new Map(),storage={get:async k=>structuredClone(map.get(k)),put:async(k,v)=>map.set(k,structuredClone(v)),delete:async k=>map.delete(k)},calls=[];let success=false;const push=async e=>{calls.push(e);return{sent:success?1:0,subscriptions:success?1:0}};
+let notifier=new AutoAttention(storage,push,()=>now);const paused={paused:'404',runRequested:true,enabled:false,recovery:{startedAt:now,eligible:true}};
+await notifier.check(paused);assert.equal(calls.length,0);now+=60001;await notifier.check(paused);assert.equal(calls.length,1);assert.equal(map.get('autoAttention:v1').sentAt,null);await notifier.check(paused);assert.equal(calls.length,1);
+notifier=new AutoAttention(storage,push,()=>now);success=true;now+=30001;await notifier.check(paused);assert.equal(calls.length,2);assert(map.get('autoAttention:v1').sentAt);now+=30001;await notifier.check(paused);assert.equal(calls.length,2);
+await notifier.check({enabled:true,runRequested:true});assert.equal(calls.at(-1).kind,'BOT_RECOVERED');const count=calls.length;await notifier.check({enabled:true,runRequested:true});assert.equal(calls.length,count);
+await notifier.check({enabled:false,paused:'Account mismatch',recovery:{startedAt:now,eligible:false}});assert.equal(calls.at(-1).kind,'BOT_ATTENTION');assert(!JSON.stringify(calls).includes('Account mismatch'));await notifier.check({enabled:false,runRequested:false});
+await notifier.check({runRequested:true},{available:false});const before=calls.length;now+=60001;await notifier.check({runRequested:true},{available:false});assert.equal(calls.length,before+1);assert.match(calls.at(-1).message,/market-data feed/);
+await notifier.check({runRequested:false});now+=60001;const stopped=calls.length;await notifier.check({runRequested:false},{available:false});assert.equal(calls.length,stopped);
+console.log('PASS attention grace, persisted push retry, deduplication, recovery notice, feed outage and owner stop');
