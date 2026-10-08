@@ -1,1 +1,8 @@
-{"name":"btc15-autotrading-review","private":true,"type":"module","scripts":{"test":"node candle-feed.test.mjs && node auto-engine.test.mjs && node integration.test.mjs"}}
+{
+  "name": "btc15-autotrading-review",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node candle-feed.test.mjs && node auto-engine.test.mjs && node integration.test.mjs && node auto-attention.test.mjs"
+  }
+}
