@@ -1,5 +1,5 @@
 // Offline implementation. No activation or deployment is performed by this package.
-export const RULES = Object.freeze({minScore:.85,minSeconds:15,maxSeconds:360,maxSecondsExclusive:true,maxTradeDollars:5,maxHoldMs:90000});
+export const RULES = Object.freeze({minScore:.90,minSeconds:15,maxSeconds:360,maxSecondsExclusive:true,maxTradeDollars:5,maxHoldMs:180000,strategyId:'score90-under6-180s-v21'});
 const KEY='autoTrading:v1';
 const finite=x=>x!==null&&x!==undefined&&x!==''&&Number.isFinite(Number(x));
 const num=x=>{if(!finite(x))throw Error('Missing numeric exchange field');return Number(x)};
@@ -9,7 +9,7 @@ export function qualifies(sc,seconds){return !!sc?.side&&['YES','NO'].includes(s
 export function signalBlockReason(sc,seconds){
  if(!sc)return 'Signal data unavailable';
  if(!sc.side||!['YES','NO'].includes(sc.side))return sc.reason||'Scalp model is WATCH/WAIT';
- if(!finite(sc.confidence)||Number(sc.confidence)<RULES.minScore)return 'Confidence below 85%';
+ if(!finite(sc.confidence)||Number(sc.confidence)<RULES.minScore)return 'Confidence below 90%';
  if(!finite(seconds))return 'Market close time unavailable';
  if(seconds>=RULES.maxSeconds)return '6 minutes or more remaining';
  if(seconds<15)return 'Less than 15 seconds remaining';
@@ -55,7 +55,7 @@ export class AutoEngine{
  if(sc.confirmation){const c=sc.confirmation,age=this.clock()-c.quoteCheckedAt,bid=num(sc.side==='YES'?fresh.yes_bid_dollars:fresh.no_bid_dollars);if(!c.passed||c.ticker!==fresh.ticker||c.side!==sc.side||!Number.isFinite(age)||age<0||age>10000)return await report('CONFIRMATION_EXPIRED','Kalshi and RSI confirmation is missing, mismatched or older than 10 sec');if(!Number.isFinite(bid)||ask-bid<0||ask-bid>.02+1e-9||bid<c.bid-.005-1e-9||ask<c.ask-.005-1e-9)return await report('QUOTE_CHANGED','Kalshi quotes no longer support the confirmed entry',{currentAsk:ask,currentBid:bid})}
  const exchangeIndex=Number.isInteger(fresh.exchange_index)&&fresh.exchange_index>=0?fresh.exchange_index:null;const balance=await this.broker.balance(exchangeIndex),budget=Math.min(5,balance),quantity=sizeForBudget(ask,budget);if(!quantity)return await report('INSUFFICIENT_BALANCE','No contract fits available balance including estimated fees');
  const accountAtEntry=await this.broker.position(fresh.ticker);if(!Number.isFinite(accountAtEntry))throw Error('Account position unavailable');
- const now=this.clock();s.position={ticker:fresh.ticker,exchangeIndex,accountAtEntry,balanceAtEntry:{at:this.clock(),balanceDollars:balance,estimatedCostDollars:quantity*ask+fee(ask,quantity),budgetDollars:budget},side:sc.side,entryConfirmation:sc.confirmation||null,target:sc.targetPrice,stop:sc.stopPrice,closeAt:close,createdAt:now,openedAt:null,entryLimit:ask,requested:quantity,entryOrder:null,exitOrders:[],remaining:0,exitTriggered:null};
+ const now=this.clock();s.position={ticker:fresh.ticker,exchangeIndex,accountAtEntry,balanceAtEntry:{at:this.clock(),balanceDollars:balance,estimatedCostDollars:quantity*ask+fee(ask,quantity),budgetDollars:budget},side:sc.side,strategyId:RULES.strategyId,maxHoldMs:RULES.maxHoldMs,entryConfirmation:sc.confirmation||null,target:sc.targetPrice,stop:sc.stopPrice,closeAt:close,createdAt:now,openedAt:null,entryLimit:ask,requested:quantity,entryOrder:null,exitOrders:[],remaining:0,exitTriggered:null};
  s.seen.push(key);await this.save(s);await this.submit(s,'entry',quantity,ask);await this.manage(s);await this.save(s);return await report(s.position?'MANAGING':'UNFILLED','Entry submitted and reconciled')
  }catch(e){s.lastError={at:this.clock(),message:String(e.message||e),stage:e.stage||null,method:e.method||null,path:e.requestPath||null,httpStatus:e.httpStatus||null};const eligible=this.recoverable(e);s.recovery={...(s.paused&&!s.recovery?.resolvedAt&&s.recovery?s.recovery:{startedAt:this.clock(),attempts:0}),eligible,nextAt:this.clock()+10000};s.paused=String(e.message||e);s.enabled=false;await this.save(s);return await report('PAUSED',s.paused)}})}
  recoverable(e){return (e.method==='GET'&&(e.httpStatus===404||e.httpStatus===429||e.httpStatus>=500))||/No executable exit bid|Settlement pending|Market closed with an open position; settlement reconciliation required|lost response|Order outcome uncertain|Unresolved order |Fills not yet reconciled|Order is not terminal|fetch failed|network|timed out|aborted/i.test(String(e.message||e))}
@@ -116,7 +116,7 @@ export class AutoEngine{
  const rawBid=p.side==='YES'?fresh.yes_bid_dollars:fresh.no_bid_dollars,bid=finite(rawBid)?Number(rawBid):null;
  if(s.paused){if(s.paused==='No executable exit bid'&&!(bid>0&&bid<1))throw Error('No executable exit bid');return} // Recovery verifies; it never sends an exit.
 
- if(!p.exitTriggered){if(bid>=p.target)p.exitTriggered='TAKE_PROFIT';else if(bid<=p.stop)p.exitTriggered='STOP';else if(now-p.openedAt>=90000||p.closeAt-now<=15000)p.exitTriggered='TIMEOUT'}
+ if(!p.exitTriggered){if(bid>=p.target)p.exitTriggered='TAKE_PROFIT';else if(bid<=p.stop)p.exitTriggered='STOP';else if(now-p.openedAt>=(p.maxHoldMs??90000)||p.closeAt-now<=15000)p.exitTriggered='TIMEOUT'}
  if(!p.exitTriggered)return;if(!(bid>0&&bid<1))throw Error('No executable exit bid');
  // Exit remains latched across partial fills. Never reverse or sell more than owned.
  if(p.lastExitAt&&now-p.lastExitAt<2000)return;
