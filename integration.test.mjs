@@ -15,7 +15,7 @@ assert.equal((await worker.fetch(req('/api/auto/control','POST',{action:'enable'
 for(const [token,expected] of [[undefined,'No owner token'],['short','shorter than 32'],['y'.repeat(32),'does not match']]){const response=await worker.fetch(req('/api/auto/status','GET',null,token),env,{});assert.equal(response.status,401);const failure=await response.json();assert(failure.detail.includes(expected));assert.equal(failure.stage,'worker');assert(!JSON.stringify(failure).includes(env.AUTO_TRADING_OWNER_TOKEN))}
 const missing=await(await worker.fetch(req('/api/auto/status'),{...env,AUTO_TRADING_OWNER_TOKEN:undefined},{})).json();assert(missing.detail.includes('deployed owner secret is missing'));
 const inner=await(await p.fetch(req('/auto/status','GET',null,'y'.repeat(32)))).json();assert.equal(inner.stage,'storage');assert(inner.detail.includes('does not match'));
-const status=await(await worker.fetch(req('/api/auto/status','GET',null,env.AUTO_TRADING_OWNER_TOKEN),env,{})).json();assert.equal(status.enabled,false);assert.equal(status.mode,'disabled');assert.equal(status.rules.minScore,.85);assert.equal(status.build,cfg.build);assert.equal(status.connection.ok,false);assert.equal(status.connection.stage,'credentials');assert.equal(map.has('autoTrading:v1'),false);
+const status=await(await worker.fetch(req('/api/auto/status','GET',null,env.AUTO_TRADING_OWNER_TOKEN),env,{})).json();assert.equal(status.enabled,false);assert.equal(status.mode,'disabled');assert.equal(status.rules.minScore,.90);assert.equal(status.build,cfg.build);assert.equal(status.connection.ok,false);assert.equal(status.connection.stage,'credentials');assert.equal(map.has('autoTrading:v1'),false);
 p.autoEngine.broker.balance=async()=>{throw Object.assign(Error('mock signing failure'),{stage:'request signing'})};const diagnostic=await(await worker.fetch(req('/api/auto/status','GET',null,env.AUTO_TRADING_OWNER_TOKEN),env,{})).json();assert.equal(diagnostic.connection.stage,'request signing');assert.equal(diagnostic.enabled,false);assert.equal(map.has('autoTrading:v1'),false);
 const failedEnable=await(await worker.fetch(req('/api/auto/control','POST',{action:'enable'},env.AUTO_TRADING_OWNER_TOKEN),env,{})).json();assert.equal(failedEnable.build,cfg.build);
 assert.equal((await worker.fetch(req('/api/auto/control','POST',{action:'enable'},env.AUTO_TRADING_OWNER_TOKEN),env,{})).status,409);
@@ -106,5 +106,21 @@ const weakScalp=scalpModel(signalBase,signalFeatures);assert(weakScalp.confidenc
 for(const sign of [1,-1]){const ft={...signalFeatures,momentum:{m1:sign*12,m3:sign*12,m5:sign*12}};const strongScalp=scalpModel(signalBase,ft);assert(strongScalp.confidence>=.85);assert.equal(strongScalp.side,sign>0?'YES':'NO')}
 const weakSettlement=modelB(signalBase,signalFeatures);assert(weakSettlement.predicted.probability<.85);assert.equal(weakSettlement.best,null);assert.equal(weakSettlement.bet,'NO BET');
 const strongSettlement=modelB({...signalBase,market:{...signalBase.market,yes_ask:.5,no_ask:.7,target:80100},btc:{latest:{p:79000}}},signalFeatures);assert(strongSettlement.best?.probability>=.85);
-assert.equal(status.rules.maxSeconds,360);assert.equal(status.rules.maxSecondsExclusive,true);assert(panel.includes('Score ≥85%'));assert(panel.includes('under 6 minutes'));
+assert.equal(status.rules.maxSeconds,360);assert.equal(status.rules.maxSecondsExclusive,true);assert(panel.includes('Score ≥90%'));assert(panel.includes('under 6 minutes'));
 console.log('PASS: scalp and settlement signals require 85 percent, live rules expose exclusive six-minute limit and owner text agrees');
+
+const {trialEligible}=await import('./worker-v450.js');
+const holdNow=Date.now,holdMap=new Map();let holdTime=1800000000000;Date.now=()=>holdTime;
+try{
+ const q=new PriceHistory({storage:{get:async k=>structuredClone(holdMap.get(k)),put:async(k,v)=>holdMap.set(k,structuredClone(v)),delete:async k=>holdMap.delete(k)}},env);
+ const m={ticker:'HOLD',close_time:new Date(holdTime+300000).toISOString(),yes_bid:.49,yes_ask:.5,no_bid:.49,no_ask:.5};
+ const sc={side:'YES',confidence:.9,entry:.5,targetPrice:.7,stopPrice:.4,timeLeft:300,confirmation:{passed:true,ticker:'HOLD',side:'YES'}};
+ const rule={minScore:.9,maxSeconds:360,requiresConfirmation:true};assert(trialEligible(rule,m,sc));assert(!trialEligible(rule,m,{...sc,confidence:.89}));assert(!trialEligible(rule,m,{...sc,confirmation:{passed:false}}));assert(!trialEligible(rule,{...m,close_time:new Date(holdTime+360000).toISOString()},sc));
+ q.autoEngine.tick=async()=>{};q.notifyAutoHealth=async()=>{};await q.scalpPaper(m,sc);
+ for(const seconds of [90,120,180]){assert.equal(holdMap.get('trial:hold-v21-'+seconds+':scalpOpen').maxHoldSeconds,seconds);assert.equal(holdMap.get('trial:hold-v21-'+seconds+':startedAt'),holdTime)}
+ holdTime+=91000;await q.scalpPaper(m,null);assert(!holdMap.get('trial:hold-v21-90:scalpOpen'));assert(holdMap.get('trial:hold-v21-120:scalpOpen'));assert(holdMap.get('trial:hold-v21-180:scalpOpen'));
+ holdTime+=30000;await q.scalpPaper(m,null);assert(!holdMap.get('trial:hold-v21-120:scalpOpen'));assert(holdMap.get('trial:hold-v21-180:scalpOpen'));
+ holdTime+=60000;await q.scalpPaper(m,null);assert(!holdMap.get('trial:hold-v21-180:scalpOpen'));const result=await(await q.fetch(new Request('https://collector/scalp-experiments'))).json();assert.equal(result.rows.filter(r=>r.cohort==='hold-v21').length,3);assert(result.rows.filter(r=>r.cohort==='hold-v21').every(r=>r.trades===1&&r.startedAt===holdTime-181000));
+}finally{Date.now=holdNow}
+assert.equal(status.rules.maxHoldMs,180000);assert(panel.includes('3-minute maximum hold'));
+console.log('PASS: separate hold-comparison ledgers and common start, independent 90/120/180-second exits, confirmation and entry-window gates');
