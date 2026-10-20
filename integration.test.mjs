@@ -122,5 +122,5 @@ try{
  holdTime+=30000;await q.scalpPaper(m,null);assert(!holdMap.get('trial:hold-v21-120:scalpOpen'));assert(holdMap.get('trial:hold-v21-180:scalpOpen'));
  holdTime+=60000;await q.scalpPaper(m,null);assert(!holdMap.get('trial:hold-v21-180:scalpOpen'));const result=await(await q.fetch(new Request('https://collector/scalp-experiments'))).json();assert.equal(result.rows.filter(r=>r.cohort==='hold-v21').length,3);assert(result.rows.filter(r=>r.cohort==='hold-v21').every(r=>r.trades===1&&r.startedAt===holdTime-181000));
 }finally{Date.now=holdNow}
-assert.equal(status.rules.maxHoldMs,180000);assert(panel.includes('3-minute maximum hold'));
+assert.equal(status.rules.maxHoldMs,120000);assert(panel.includes('2-minute maximum hold'));
 console.log('PASS: separate hold-comparison ledgers and common start, independent 90/120/180-second exits, confirmation and entry-window gates');
