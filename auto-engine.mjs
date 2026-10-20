@@ -1,5 +1,5 @@
 // Offline implementation. No activation or deployment is performed by this package.
-export const RULES = Object.freeze({minScore:.90,minSeconds:15,maxSeconds:360,maxSecondsExclusive:true,maxTradeDollars:5,maxHoldMs:180000,strategyId:'score90-under6-180s-v21'});
+export const RULES = Object.freeze({minScore:.90,minSeconds:15,maxSeconds:360,maxSecondsExclusive:true,maxTradeDollars:5,maxHoldMs:120000,strategyId:'score90-under6-120s-v22'});
 const KEY='autoTrading:v1';
 const finite=x=>x!==null&&x!==undefined&&x!==''&&Number.isFinite(Number(x));
 const num=x=>{if(!finite(x))throw Error('Missing numeric exchange field');return Number(x)};
