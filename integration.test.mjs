@@ -106,8 +106,8 @@ const weakScalp=scalpModel(signalBase,signalFeatures);assert(weakScalp.confidenc
 for(const sign of [1,-1]){const ft={...signalFeatures,momentum:{m1:sign*12,m3:sign*12,m5:sign*12}};const strongScalp=scalpModel(signalBase,ft);assert(strongScalp.confidence>=.85);assert.equal(strongScalp.side,sign>0?'YES':'NO')}
 const weakSettlement=modelB(signalBase,signalFeatures);assert(weakSettlement.predicted.probability<.85);assert.equal(weakSettlement.best,null);assert.equal(weakSettlement.bet,'NO BET');
 const strongSettlement=modelB({...signalBase,market:{...signalBase.market,yes_ask:.5,no_ask:.7,target:80100},btc:{latest:{p:79000}}},signalFeatures);assert(strongSettlement.best?.probability>=.85);
-assert.equal(status.rules.maxSeconds,360);assert.equal(status.rules.maxSecondsExclusive,true);assert(panel.includes('Score ≥90%'));assert(panel.includes('under 6 minutes'));
-console.log('PASS: scalp and settlement signals require 85 percent, live rules expose exclusive six-minute limit and owner text agrees');
+assert.equal(status.rules.maxSeconds,480);assert.equal(status.rules.maxSecondsExclusive,false);assert(panel.includes('Strategy: ≥90% · final 8 min'));assert(panel.includes('8 minutes remaining'));
+console.log('PASS: scalp and settlement signals require 85 percent, live rules expose inclusive eight-minute limit and owner text agrees');
 
 const {trialEligible}=await import('./worker-v450.js');
 const holdNow=Date.now,holdMap=new Map();let holdTime=1800000000000;Date.now=()=>holdTime;
@@ -122,5 +122,8 @@ try{
  holdTime+=30000;await q.scalpPaper(m,null);assert(!holdMap.get('trial:hold-v21-120:scalpOpen'));assert(holdMap.get('trial:hold-v21-180:scalpOpen'));
  holdTime+=60000;await q.scalpPaper(m,null);assert(!holdMap.get('trial:hold-v21-180:scalpOpen'));const result=await(await q.fetch(new Request('https://collector/scalp-experiments'))).json();assert.equal(result.rows.filter(r=>r.cohort==='hold-v21').length,3);assert(result.rows.filter(r=>r.cohort==='hold-v21').every(r=>r.trades===1&&r.startedAt===holdTime-181000));
 }finally{Date.now=holdNow}
-assert.equal(status.rules.maxHoldMs,120000);assert(panel.includes('2-minute maximum hold'));
+assert.equal(status.rules.maxHoldMs,90000);assert(panel.includes('90-second maximum hold'));
 console.log('PASS: separate hold-comparison ledgers and common start, independent 90/120/180-second exits, confirmation and entry-window gates');
+
+const selectedTrial=await(await p.fetch(new Request('https://collector/scalp-experiments'))).json();const late90=selectedTrial.rows.find(r=>r.id==='late90');assert.equal(status.rules.strategyId,late90.id);assert.equal(status.rules.minScore,late90.minScore);assert.equal(status.rules.maxSeconds,late90.maxSeconds);assert.equal(status.rules.maxHoldMs,(late90.maxHoldSeconds||90)*1000);assert.equal(status.rules.maxSecondsExclusive,false);
+console.log('PASS: live strategy identity, threshold, inclusive entry window and hold match the selected late90 paper row');
