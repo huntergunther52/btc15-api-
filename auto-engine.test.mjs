@@ -91,6 +91,19 @@ await test('entry health records exact filters and counts without sending orders
  b.close=time+300000;b.ask=.51;await engine.tick({ticker:'T'},signal);s=await engine.status();assert.equal(s.lastCheck.state,'PRICE_MOVED');assert.equal(s.lastCheck.currentAsk,.51);assert.equal(s.checkCounts.NO_SIGNAL,2);assert.equal(b.calls.length,0);
  await engine.control('disable');await engine.tick({ticker:'T'},signal);assert.equal((await engine.status()).lastCheck.state,'OFF');assert.equal(b.calls.length,0);
 });
+await test('entry funding evidence survives ordinary checks and checkpoint restart',async()=>{
+ const{engine,b,map}=fixture();const market=b.market.bind(b);
+ b.market=async t=>({...await market(t),exchange_index:2});b.balance=async index=>index===2?0:98.48;
+ await engine.control('enable');await engine.tick({ticker:'T'},signal);
+ let s=await engine.state();
+ assert.equal(s.lastEntryDecision.state,'INSUFFICIENT_BALANCE');
+ assert.equal(s.lastEntryDecision.balanceDollars,0);assert.equal(s.lastEntryDecision.exchangeIndex,2);
+ assert.equal(s.lastEntryDecision.requestedQuantity,0);
+ time+=61000;await engine.tick({ticker:'T'},null);
+ s=await engine.state();assert.equal(s.lastCheck.state,'NO_SIGNAL');
+ assert.equal(s.lastEntryDecision.state,'INSUFFICIENT_BALANCE');
+ assert.deepEqual(map.get('autoTrading:v1').lastEntryDecision,s.lastEntryDecision);assert.equal(b.calls.length,0);
+});
 await test('transient unfilled order recovers automatically and preserves owner run intent',async()=>{
  const{engine,b}=fixture();b.entryQty=0;await engine.control('enable');const order=b.order.bind(b);let first=true;b.order=async id=>{if(first){first=false;throw Object.assign(Error('Kalshi GET HTTP 404 (not_found)'),{method:'GET',httpStatus:404})}return order(id)};
  await engine.tick({ticker:'T'},signal);assert.equal((await engine.state()).enabled,false);assert((await engine.state()).position);const calls=b.calls.length;time+=10001;await engine.tick({ticker:'T'},null);const s=await engine.state();assert.equal(s.position,null);assert.equal(s.history.at(-1).status,'UNFILLED');assert.equal(s.paused,null);assert.equal(s.enabled,true);assert.equal(b.calls.length,calls);assert.equal(s.history.at(-1).recoveryEvidence.fillCount,0);
