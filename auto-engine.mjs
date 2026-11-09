@@ -3,6 +3,8 @@ export const RULES = Object.freeze({minScore:.90,minSeconds:15,maxSeconds:480,ma
 const KEY='autoTrading:v1';
 const finite=x=>x!==null&&x!==undefined&&x!==''&&Number.isFinite(Number(x));
 const num=x=>{if(!finite(x))throw Error('Missing numeric exchange field');return Number(x)};
+// Kalshi reports counts to two decimal places; do quantity math in hundredths.
+function countUnits(x){const n=num(x)*100,u=Math.round(n);if(!Number.isSafeInteger(u)||Math.abs(n-u)>1e-6)throw Error('Invalid contract quantity');return u}
 const fee=(p,n)=>Math.ceil(.07*n*p*(1-p)*100)/100;
 export function sizeForBudget(p,budget=5){if(!(p>0&&p<1))return 0;let n=Math.floor(budget/p);while(n>0&&n*p+fee(p,n)>budget+1e-9)n--;return n}
 export function qualifies(sc,seconds){return !!sc?.side&&['YES','NO'].includes(sc.side)&&finite(sc.confidence)&&Number(sc.confidence)>=RULES.minScore&&finite(seconds)&&seconds>=RULES.minSeconds&&(RULES.maxSecondsExclusive?seconds<RULES.maxSeconds:seconds<=RULES.maxSeconds)&&finite(sc.entry)&&sc.entry>.04&&sc.entry<.96&&finite(sc.targetPrice)&&finite(sc.stopPrice)&&sc.targetPrice>sc.entry&&sc.stopPrice<sc.entry}
@@ -17,8 +19,8 @@ export function signalBlockReason(sc,seconds){
  if(!finite(sc.targetPrice)||!finite(sc.stopPrice)||sc.targetPrice<=sc.entry||sc.stopPrice>=sc.entry)return 'Invalid target or stop';
  return null;
 }
-export function orderPayload(p,leg,quantity,heldPrice,cid){if(!(quantity>0&&Number.isInteger(quantity))||!(heldPrice>0&&heldPrice<1))throw Error('Invalid order quantity or price');const yesExposure=(p.side==='YES')===(leg==='entry');const price=p.side==='YES'?heldPrice:1-heldPrice;return{ticker:p.ticker,client_order_id:cid,exchange_index:Number.isInteger(p.exchangeIndex)&&p.exchangeIndex>=0?p.exchangeIndex:-1,side:yesExposure?'bid':'ask',count:quantity.toFixed(2),price:price.toFixed(4),time_in_force:'immediate_or_cancel',self_trade_prevention_type:'taker_at_cross',cancel_order_on_pause:true,reduce_only:leg==='exit'}}
-export function summarizeFills(fills,side){const ids=new Set;let quantity=0,value=0,fees=0;for(const f of fills){if(!f.fill_id||ids.has(f.fill_id))continue;ids.add(f.fill_id);const q=num(f.count_fp),price=num(side==='YES'?f.yes_price_dollars:f.no_price_dollars),paid=num(f.fee_cost);if(q<0||price<0||price>1||paid<0)throw Error('Invalid fill');quantity+=q;value+=q*price;fees+=paid}return{quantity,value,fees}}
+export function orderPayload(p,leg,quantity,heldPrice,cid){const units=countUnits(quantity);if(units<=0||(leg==='entry'&&units%100!==0)||!(heldPrice>0&&heldPrice<1))throw Error('Invalid order quantity or price');const yesExposure=(p.side==='YES')===(leg==='entry');const price=p.side==='YES'?heldPrice:1-heldPrice;return{ticker:p.ticker,client_order_id:cid,exchange_index:Number.isInteger(p.exchangeIndex)&&p.exchangeIndex>=0?p.exchangeIndex:-1,side:yesExposure?'bid':'ask',count:(units/100).toFixed(2),price:price.toFixed(4),time_in_force:'immediate_or_cancel',self_trade_prevention_type:'taker_at_cross',cancel_order_on_pause:true,reduce_only:leg==='exit'}}
+export function summarizeFills(fills,side){const ids=new Set;let units=0,value=0,fees=0;for(const f of fills){if(!f.fill_id||ids.has(f.fill_id))continue;ids.add(f.fill_id);const count=countUnits(f.count_fp),price=num(side==='YES'?f.yes_price_dollars:f.no_price_dollars),paid=num(f.fee_cost);if(count<0||price<0||price>1||paid<0)throw Error('Invalid fill');units+=count;value+=count/100*price;fees+=paid}return{quantity:units/100,value,fees}}
 export class AutoEngine{
  constructor(storage,broker,clock=()=>Date.now(),uuid=()=>crypto.randomUUID()){this.storage=storage;this.broker=broker;this.clock=clock;this.uuid=uuid;this.queue=Promise.resolve()}
  async state(){const s=await this.storage.get(KEY)||{enabled:false,paused:null,position:null,seen:[],history:[],orders:[]};if(this.latestReport){s.lastCheck=structuredClone(this.latestReport.lastCheck);s.checkCounts=structuredClone(this.latestReport.checkCounts)}return s}
@@ -101,17 +103,17 @@ export class AutoEngine{
  }
  async submit(s,leg,q,price){const p=s.position,cid=this.uuid(),intent={clientOrderId:cid,orderId:null,leg,quantity:q,price,at:this.clock(),state:'PENDING'};s.orders.push(intent);if(leg==='entry')p.entryOrder=cid;else p.exitOrders.push(cid);await this.save(s);try{const result=await this.broker.create(orderPayload(p,leg,q,price,cid));if(!result.order_id)throw Error('Missing order ID');intent.orderId=result.order_id;intent.state='ACKNOWLEDGED';await this.save(s)}catch(e){intent.state='UNCERTAIN';intent.error=String(e.message||e);intent.errorStage=e.stage||'order acknowledgement';intent.exchangeCode=e.exchangeCode||null;await this.save(s);throw Error('Order outcome uncertain; reconcile before another order: '+e.message)}}
  async resolve(s,cid){const i=s.orders.find(x=>x.clientOrderId===cid);if(!i)throw Error('Missing durable order intent');if(!i.orderId){const matches=await this.broker.findClient(s.position.ticker,cid);if(matches.length!==1)throw Error('Unresolved order '+cid+'; no order will be resubmitted');i.orderId=matches[0].order_id;i.state='ACKNOWLEDGED';await this.save(s)}const order=i.verifiedUnfilledOrder||await this.broker.order(i.orderId,s.position.ticker,cid),fills=await this.broker.fills(i.orderId),sum=summarizeFills(fills,s.position.side);if(Math.abs(num(order.fill_count_fp)-sum.quantity)>1e-6)throw Error('Fills not yet reconciled for '+i.orderId);if(num(order.remaining_count_fp)>0||order.status==='resting')throw Error('Unexpected resting IOC order: '+i.orderId);if(!['executed','canceled'].includes(order.status))throw Error('Order is not terminal');i.state='RECONCILED';i.filledQuantity=sum.quantity;if(sum.quantity===0)i.verifiedUnfilledOrder=order;return sum}
- async manage(s){const p=s.position;if(!p.entryOrder)throw Error('Entry intent was not persisted; reconcile manually');const entry=await this.resolve(s,p.entryOrder);let exit={quantity:0,value:0,fees:0};for(const cid of p.exitOrders){const z=await this.resolve(s,cid);exit.quantity+=z.quantity;exit.value+=z.value;exit.fees+=z.fees}p.remaining=entry.quantity-exit.quantity-(p.accountAdjustedQuantity||0);if(p.remaining< -1e-6)throw Error('Exit fills exceed entry fills');
+ async manage(s){const p=s.position;if(!p.entryOrder)throw Error('Entry intent was not persisted; reconcile manually');const entry=await this.resolve(s,p.entryOrder);let exit={quantity:0,value:0,fees:0};for(const cid of p.exitOrders){const z=await this.resolve(s,cid);exit.quantity=(countUnits(exit.quantity)+countUnits(z.quantity))/100;exit.value+=z.value;exit.fees+=z.fees}p.remaining=(countUnits(entry.quantity)-countUnits(exit.quantity)-countUnits(p.accountAdjustedQuantity||0))/100;if(p.remaining<0)throw Error('Exit fills exceed entry fills');
  if(!entry.quantity){s.history.push({...p,status:'UNFILLED',entry,exit,recoveryEvidence:{checkedAt:this.clock(),orderId:s.orders.find(x=>x.clientOrderId===p.entryOrder)?.orderId,fillCount:0},netPnlDollars:0,closedAt:this.clock()});s.position=null;return}
  if(!p.openedAt)p.openedAt=s.orders.find(x=>x.clientOrderId===p.entryOrder).at;
- const held=await this.broker.position(p.ticker),expected=(p.side==='YES'?1:-1)*p.remaining;
+ const held=await this.broker.position(p.ticker);
  // Closed markets can become flat through settlement, without any exit fill.
  const fresh=p.remaining>1e-6?await this.broker.market(p.ticker):null,now=this.clock();
  if(fresh&&(fresh.status!=='active'||now>=p.closeAt)){await this.reconcileSettlement(s,fresh,entry,exit,held);return}
  if(!Number.isFinite(held))throw Error('Account position unavailable');
- const available=Math.max(0,(p.side==='YES'?1:-1)*held);
- if(p.remaining>available+1e-6){p.accountAdjustedQuantity=(p.accountAdjustedQuantity||0)+p.remaining-available;p.remaining=available;p.accountActivityObserved=true;}
- if(p.accountAdjustedQuantity>0&&p.remaining<1){s.history.push({...p,remaining:0,status:'ACCOUNT_ADJUSTED',entry,exit,netPnlDollars:null,closedAt:now,note:'Shared account activity reduced available bot exposure. Manual proceeds are not attributed to bot P&L.'});s.position=null;return}
+ const available=Math.max(0,(p.side==='YES'?1:-1)*countUnits(held))/100;
+ if(p.remaining>available+1e-6){p.accountAdjustedQuantity=(countUnits(p.accountAdjustedQuantity||0)+countUnits(p.remaining)-countUnits(available))/100;p.remaining=available;p.accountActivityObserved=true;}
+ if(p.accountAdjustedQuantity>0&&p.remaining===0){s.history.push({...p,remaining:0,status:'ACCOUNT_ADJUSTED',entry,exit,netPnlDollars:null,closedAt:now,note:'Shared account activity reduced available bot exposure. Manual proceeds are not attributed to bot P&L.'});s.position=null;return}
  if(p.remaining<=1e-6){s.history.push({...p,status:'CLOSED',entry,exit,netPnlDollars:p.accountAdjustedQuantity?null:exit.value-entry.value-entry.fees-exit.fees,closedAt:now});s.position=null;return}
  const rawBid=p.side==='YES'?fresh.yes_bid_dollars:fresh.no_bid_dollars,bid=finite(rawBid)?Number(rawBid):null;
  if(s.paused){if(s.paused==='No executable exit bid'&&!(bid>0&&bid<1))throw Error('No executable exit bid');return} // Recovery verifies; it never sends an exit.
@@ -120,9 +122,9 @@ export class AutoEngine{
  if(!p.exitTriggered)return;if(!(bid>0&&bid<1))throw Error('No executable exit bid');
  // Exit remains latched across partial fills. Never reverse or sell more than owned.
  if(p.lastExitAt&&now-p.lastExitAt<2000)return;
- if(!(Math.floor(p.remaining)>0))throw Error('Fractional position needs manual reconciliation');p.lastExitAt=now;await this.save(s);await this.submit(s,'exit',Math.floor(Math.min(p.remaining,available)),bid);
+ p.lastExitAt=now;await this.save(s);await this.submit(s,'exit',Math.min(p.remaining,available),bid);
  // Reconcile immediately, with a later tick retrying only the unfilled remainder.
- const last=await this.resolve(s,p.exitOrders.at(-1));p.remaining-=last.quantity;await this.save(s);
+ const last=await this.resolve(s,p.exitOrders.at(-1));p.remaining=(countUnits(p.remaining)-countUnits(last.quantity))/100;if(p.remaining<0)throw Error('Exit fills exceed remaining position');await this.save(s);
  if(p.remaining<=1e-6){await this.finish(s)}
  }
  async reconcileSettlement(s,market,entry,exit,held){
@@ -138,8 +140,12 @@ export class AutoEngine{
  for(const k of ['quantity','value','fees'])if(Math.abs(marketEntry[k]-entry[k])>1e-6||Math.abs(marketExit[k]-exit[k])>1e-6)throw Error('Settlement pending: market fills do not yet agree with order fills');
  const matches=records.filter(x=>x.ticker===p.ticker&&x.exchange_index===p.exchangeIndex);
  if(matches.length!==1)throw Error('Settlement pending: a unique matching exchange settlement is not available');
- const record=matches[0],yes=num(record.yes_count_fp),no=num(record.no_count_fp),quantity=p.side==='YES'?yes:no,opposite=p.side==='YES'?no:yes,settledAt=Date.parse(record.settled_time);
- if(!mixed&&(quantity<0||opposite!==0||Math.abs(quantity-p.remaining)>1e-6))throw Error('Settlement quantities differ from bot ledger; manual reconciliation required');
+ const record=matches[0],yes=countUnits(record.yes_count_fp),no=countUnits(record.no_count_fp),same=p.side==='YES'?yes:no,opposite=p.side==='YES'?no:yes,remaining=countUnits(p.remaining),quantity=remaining/100,settledAt=Date.parse(record.settled_time);
+ // Kalshi can report gross opposing counts for a partially closed position.
+ // Accept those only when this position's verified fills fully explain both counts.
+ const netCounts=same===remaining&&opposite===0;
+ const grossCounts=p.accountAtEntry===0&&opposite>0&&same===countUnits(entry.quantity)&&opposite===countUnits(exit.quantity)&&same-opposite===remaining&&fills.every(x=>x.order_id===intent.orderId||exitIds.has(x.order_id));
+ if(!mixed&&(remaining<0||(!netCounts&&!grossCounts)))throw Error('Settlement quantities differ from bot ledger; manual reconciliation required');
  if(!Number.isFinite(settledAt)||settledAt<close||settledAt>this.clock()+1000||!['yes','no'].includes(record.market_result))throw Error('Settlement pending: final binary settlement evidence unavailable');
  if(market.result&&market.result!==record.market_result)throw Error('Market and account settlement results disagree');
  const expectedRevenue=(record.market_result===p.side.toLowerCase()?quantity:0),revenue=num(record.revenue)/100;
