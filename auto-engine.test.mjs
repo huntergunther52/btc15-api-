@@ -23,6 +23,20 @@ await test('owner controls require a long secret',async()=>{const r=new Request(
 await test('full entry, target exit, actual fees and preserved ledger',async()=>{const{engine,b}=fixture();await engine.control('enable');await engine.tick({ticker:'T'},signal);assert.equal(b.calls.length,1);const n=Number(b.calls[0].count);assert(n*.5+Math.ceil(.07*n*.25*100)/100<=5);b.bid=.65;await engine.tick({ticker:'T'},signal);const s=await engine.status();assert.equal(s.position,null);assert.equal(s.history.length,1);assert.equal(b.positionCount,0);assert(Math.abs(s.history[0].netPnlDollars-(n*.15-2*n*.01))<1e-8);await engine.tick({ticker:'T'},signal);assert.equal(b.calls.length,2)});
 await test('partial entry manages only filled quantity',async()=>{const{engine,b}=fixture();b.entryQty=3;await engine.control('enable');await engine.tick({ticker:'T'},signal);assert.equal((await engine.status()).position.remaining,3);b.bid=.39;await engine.tick({ticker:'T'},signal);assert.equal(Number(b.calls[1].count),3);assert.equal((await engine.status()).history[0].exitTriggered,'STOP')});
 await test('partial exit retains remainder and latched trigger',async()=>{const{engine,b}=fixture();b.entryQty=3;b.exitQty=1;await engine.control('enable');await engine.tick({ticker:'T'},signal);b.bid=.65;await engine.tick({ticker:'T'},signal);assert.equal((await engine.status()).position.remaining,2);b.bid=.50;time+=2100;await engine.tick({ticker:'T'},null);assert.equal(Number(b.calls.at(-1).count),2);assert.equal((await engine.status()).position.remaining,1);time+=2100;await engine.tick({ticker:'T'},null);assert.equal((await engine.status()).position,null);assert.equal(b.positionCount,0)});
+function splitEntry(b){
+ const original=b.allFills.shift();
+ const counts=['1.20','0.10','3.40','0.10','0.10','0.10'];
+ const fees=['.0075','.0006','.0215','.0007','.0006','.0006'];
+ b.allFills.unshift(...counts.map((count_fp,i)=>({...original,fill_id:'split-'+i,count_fp,yes_price_dollars:'.90',no_price_dollars:'.10',fee_cost:fees[i]})));
+}
+await test('five contracts filled in fractions submit a five-contract exit; a true fractional remainder stays reducible',async()=>{
+ const {engine,b}=fixture();b.entryQty=5;await engine.control('enable');await engine.tick({ticker:'T'},signal);splitEntry(b);
+ b.bid=.4;b.exitQty=4.75;await engine.tick({ticker:'T'},null);
+ assert.equal(b.calls[1].count,'5.00');assert.equal((await engine.state()).position.remaining,.25);
+ time+=2100;await engine.tick({ticker:'T'},null);
+ assert.equal(b.calls[2].count,'0.25');assert.equal(b.calls[2].reduce_only,true);
+ const s=await engine.state();assert.equal(s.paused,null);assert.equal(s.position,null);assert.equal(s.history.at(-1).exit.quantity,5);
+});
 await test('lost POST response is reconciled without resubmission, including restart',async()=>{const{engine,b,map}=fixture();await engine.control('enable');b.throwAfterAccept=true;await engine.tick({ticker:'T'},signal);assert.equal(b.calls.length,1);assert((await engine.status()).paused);const restarted=new AutoEngine({get:async k=>structuredClone(map.get(k)),put:async(k,v)=>map.set(k,structuredClone(v))},b,()=>time,()=>String(++ids));await restarted.control('reconcile');assert.equal(b.calls.length,1);assert((await restarted.status()).position.remaining>0);assert.equal((await restarted.status()).enabled,false)});
 await test('manual holdings and resting orders coexist; higher ask still blocks',async()=>{for(const mode of ['position','resting','price']){const{engine,b}=fixture();await engine.control('enable');if(mode==='position')b.manualPosition=2;if(mode==='resting')b.openOrders=[{}];if(mode==='price')b.ask=.51;await engine.tick({ticker:'T'},signal);assert.equal(b.calls.length,mode==='price'?0:1)}});
 await test('disable stops new entries but continues exiting owned position',async()=>{const{engine,b}=fixture();await engine.control('enable');await engine.tick({ticker:'T'},signal);await engine.control('disable');time+=91000;b.close=time+300000;await engine.tick({ticker:'T'},null);assert.equal((await engine.status()).position,null);assert.equal((await engine.status()).history[0].exitTriggered,'TIMEOUT');await engine.tick({ticker:'NEW'},signal);assert.equal(b.calls.length,2)});
@@ -130,6 +144,29 @@ await test('closed settled position recovers with actual settlement revenue and 
 });
 await test('partial exit plus settlement accounts only remaining contracts and honors owner stop',async()=>{
  const {engine,b}=await settlementFixture({partial:true,stop:true});const before=b.calls.length;await engine.tick({ticker:'NEW'},signal);const s=await engine.state(),h=s.history.at(-1);assert.equal(h.exit.quantity,3);assert.equal(h.settlement.quantity,h.entry.quantity-3);assert.equal(s.enabled,false);assert.equal(s.position,null);assert.equal(b.calls.length,before);
+});
+await test('owner reconciliation handles the legacy split-fill pause and gross settlement counts without placing orders',async()=>{
+ for(const variant of ['reported','bad-count','bad-revenue']){
+  const {engine,b}=fixture();const market=b.market.bind(b);b.market=async t=>({...await market(t),exchange_index:2});
+  b.entryQty=5;await engine.control('enable');await engine.tick({ticker:'T'},signal);splitEntry(b);
+  b.bid=.4;b.exitQty=4;await engine.tick({ticker:'T'},null);
+  Object.assign(b.allFills.at(-1),{yes_price_dollars:'.80',no_price_dollars:'.20',fee_cost:'.0448'});
+  const legacy=await engine.state();legacy.enabled=false;legacy.paused='Fractional position needs manual reconciliation';legacy.position.remaining=.9999999999999991;
+  await engine.save(legacy);
+  const closeAt=legacy.position.closeAt;time=closeAt+3000;b.positionCount=0;
+  b.market=async ticker=>({ticker,status:'finalized',result:'no',close_time:new Date(closeAt).toISOString()});
+  b.settlements=async()=>[{ticker:'T',exchange_index:2,market_result:'no',yes_count_fp:'5.00',no_count_fp:variant==='bad-count'?'3.00':'4.00',revenue:variant==='bad-revenue'?400:0,settled_time:new Date(closeAt+100).toISOString()}];
+  b.marketFills=async()=>b.allFills;
+  const calls=b.calls.length;
+  if(variant==='reported'){
+   await engine.control('reconcile');
+   const s=await engine.state(),h=s.history.at(-1);assert.equal(s.enabled,false);assert.equal(s.paused,null);assert.equal(s.position,null);assert.equal(h.status,'SETTLED');assert.equal(h.settlement.quantity,1);assert.equal(h.settlement.revenueDollars,0);assert(Math.abs(h.netPnlDollars+1.3763)<1e-9);
+  }else{
+   await assert.rejects(engine.control('reconcile'),/Settlement (quantities|payout) differ/);
+   const s=await engine.state();assert(s.position);assert.equal(s.enabled,false);assert(s.paused);assert.equal(s.history.length,0);
+  }
+  assert.equal(b.calls.length,calls);
+ }
 });
 await test('missing settlement retries with backoff and legacy no-bid pause is migrated',async()=>{
  const {engine,b}=await settlementFixture();b.settlements=async()=>[];const state=await engine.state();state.recovery.eligible=false;await engine.save(state);const before=b.calls.length;
